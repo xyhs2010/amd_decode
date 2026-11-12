@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import Qwen3Config
+from .int4 import dequantize_int4, quantize_int4
 from .rope import apply_rope, build_cos_sin, rope_parameters
 from .weights import Qwen3Weights
 
@@ -47,11 +48,17 @@ class Qwen3Torch:
         model_dir: str | Path,
         device: str | torch.device = "cuda",
         dtype: torch.dtype = torch.float16,
+        weight_bits: int = 4,
     ) -> None:
+        if weight_bits not in (4, 16):
+            raise ValueError(f"weight_bits must be 4 or 16, got {weight_bits}")
         self.cfg = Qwen3Config.from_model_dir(model_dir)
         self.device = torch.device(device)
         self.dtype = dtype
+        self.weight_bits = weight_bits
         self.weights = Qwen3Weights(model_dir)
+        # name -> (q, scale, zero) on CPU, computed once per weight.
+        self._int4_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
         # Kept on CPU: embedding lookup only touches a few rows, and lm_head is
         # moved to the GPU only after all layers have released their weights.
@@ -69,8 +76,31 @@ class Qwen3Torch:
         # need an extra full-size buffer.
         return tensor.to(self.device).to(self.dtype)
 
+    @staticmethod
+    def _is_int4_weight(name: str) -> bool:
+        # torchao quantizes nn.Linear modules, not embeddings or norms.
+        return name == "lm_head.weight" or name.endswith("_proj.weight")
+
+    def _linear_weight(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        """Return a dense weight on the GPU, quantizing int4 if requested."""
+        if self.weight_bits != 4 or not self._is_int4_weight(name):
+            return self._to_gpu(tensor)
+        try:
+            if name not in self._int4_cache:
+                self._int4_cache[name] = quantize_int4(tensor)
+        except ValueError:
+            # Same behaviour as torchao: skip weights whose in_features is not
+            # divisible by the group size.
+            return self._to_gpu(tensor)
+        q, scale, zero = self._int4_cache[name]
+        return dequantize_int4(q, scale, zero, device=self.device, dtype=self.dtype)
+
     def _load_layer(self, layer_idx: int) -> dict[str, torch.Tensor]:
-        return {name: self._to_gpu(t) for name, t in self.weights.layer(layer_idx).items()}
+        prefix = f"model.layers.{layer_idx}."
+        return {
+            name: self._linear_weight(prefix + name, tensor)
+            for name, tensor in self.weights.layer(layer_idx).items()
+        }
 
     def _rms(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         # Matches transformers' Qwen3RMSNorm ordering.
@@ -200,7 +230,7 @@ class Qwen3Torch:
             del p
 
         x = self._rms(x, self.final_norm.to(self.device).to(self.dtype))
-        lm_head = self.lm_head.to(self.device).to(self.dtype)
+        lm_head = self._linear_weight("lm_head.weight", self.lm_head)
         logits = F.linear(x, lm_head)
         del lm_head
 

@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from .config import Qwen3Config
 from .kv_cache_file import SavedKVCache, SavedKVCacheView
 from .model import KVCache, Qwen3Torch
+from .rope import build_cos_sin
 
 
 def _sync(device: torch.device) -> None:
@@ -123,6 +124,59 @@ def run_selfcheck(model: Qwen3Torch, tokens: torch.Tensor, tokenizer) -> None:
         print(f"peak GPU memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
 
+def run_kv_compare(model: Qwen3Torch, sample: str, n_tokens: int = 512) -> None:
+    """Compare locally computed layer-0 K/V with the saved cache.
+
+    This checks three things at once: the cache stores post-RoPE K, our YaRN
+    matches the prefill's, and the q8 block-scale dequantization is laid out
+    correctly. With int4 weights the only remaining difference should be
+    bf16-vs-fp16 activation arithmetic.
+    """
+    print("\n== local layer-0 K/V vs saved cache ==")
+    try:
+        cache = SavedKVCache(sample)
+        tokens = cache.tokens()[:n_tokens]
+    except (PermissionError, OSError) as exc:
+        print(f"[warn] cannot read cache: {exc}")
+        return
+
+    n = tokens.numel()
+    p = model._load_layer(0)
+    x = model.embed[tokens].unsqueeze(0).to(model.device).to(model.dtype)
+    cos, sin = build_cos_sin(
+        torch.arange(n, device=model.device),
+        model.inv_freq,
+        model.attention_scaling,
+        model.dtype,
+    )
+    _, k, v = model._attn_prep(model._rms(x, p["input_layernorm.weight"]), p, cos, sin)
+    k_local = k[0].float().cpu()
+    v_local = v[0].float().cpu()
+    del p, x, k, v
+
+    k_saved, v_saved = cache.layer(0, device="cpu", dtype=torch.float32)
+    k_saved = k_saved[0, :, :n].float()
+    v_saved = v_saved[0, :, :n].float()
+
+    def report(name: str, a: torch.Tensor, b: torch.Tensor, norm_ratio: bool = False) -> None:
+        c = F.cosine_similarity(a.flatten(1), b.flatten(1), dim=-1)
+        print(
+            f"{name}: cos mean={c.mean():.6f} min={c.min():.6f} p1={torch.quantile(c, 0.01):.6f} | "
+            f"mean|x| local={a.abs().mean():.5f} saved={b.abs().mean():.5f} | "
+            f"max|x| local={a.abs().max():.3f} saved={b.abs().max():.3f}"
+        )
+        if norm_ratio:
+            r = a.norm(dim=-1) / b.norm(dim=-1).clamp_min(1e-6)
+            print(
+                f"    per-head norm ratio: mean={r.mean():.5f} std={r.std():.5f} "
+                f"min={r.min():.3f} max={r.max():.3f}"
+            )
+
+    print(f"tokens={n} weight_bits={model.weight_bits} dtype={model.dtype}")
+    report("K", k_local, k_saved, norm_ratio=True)
+    report("V", v_local, v_saved)
+
+
 def run_cache_smoke(model: Qwen3Torch, sample: str, tokenizer) -> None:
     """Decode one token from a saved cache.
 
@@ -180,8 +234,12 @@ def main() -> None:
     ap.add_argument("--tokens", type=int, default=8, help="number of tokens for prefill-vs-decode")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="float16", choices=("float16", "bfloat16"))
+    ap.add_argument("--weight-bits", type=int, default=4, choices=(4, 16),
+                    help="4 = torchao-tinygemm-compatible int4, 16 = raw bf16 weights")
     ap.add_argument("--cache-decode", action="store_true", help="also run one decode step from --sample")
-    ap.add_argument("--skip-selfcheck", action="store_true", help="only run --cache-decode")
+    ap.add_argument("--compare-kv", action="store_true", help="compare local layer-0 K/V against --sample")
+    ap.add_argument("--kv-tokens", type=int, default=512, help="tokens for --compare-kv")
+    ap.add_argument("--skip-selfcheck", action="store_true", help="skip the prefill-vs-decode check")
     ap.add_argument("--no-tokenizer", action="store_true")
     args = ap.parse_args()
 
@@ -199,16 +257,21 @@ def main() -> None:
         f"heads={cfg.num_attention_heads} kv_heads={cfg.num_key_value_heads} "
         f"head_dim={cfg.head_dim} vocab={cfg.vocab_size}\n"
         f"rope={cfg.rope_scaling} theta={cfg.rope_theta}\n"
-        f"device={device} dtype={args.dtype}"
+        f"device={device} dtype={args.dtype} weight_bits={args.weight_bits}"
     )
 
     tokenizer = None if args.no_tokenizer else _load_tokenizer(args.model)
     tokens = _get_tokens(args, tokenizer)
     dtype = getattr(torch, args.dtype)
 
-    model = Qwen3Torch(args.model, device=device, dtype=dtype)
+    model = Qwen3Torch(args.model, device=device, dtype=dtype, weight_bits=args.weight_bits)
     if not args.skip_selfcheck:
         run_selfcheck(model, tokens, tokenizer)
+    if args.compare_kv:
+        if not args.sample:
+            print("[warn] --compare-kv needs --sample")
+        else:
+            run_kv_compare(model, args.sample, args.kv_tokens)
     if args.cache_decode:
         if not args.sample:
             print("[warn] --cache-decode needs --sample")
