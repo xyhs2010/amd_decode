@@ -8,6 +8,10 @@ Run from the repo root:
 The second case is the one to copy when writing a real custom layer: subclass
 ``Qwen3Torch``, keep the ``_layer`` signature, and let ``align`` prove the new
 maths is byte-identical to the reference before wiring it into the hot path.
+
+``align`` takes two backend objects and one cache per object.  A backend is
+any object with ``set_kv_cache`` / ``set_hook`` / ``forward`` / ``get_features``
+(see ``amd_decode.align.DecodeModel``).
 """
 
 from __future__ import annotations
@@ -16,7 +20,8 @@ import argparse
 
 import torch
 
-from amd_decode.with_torch import Qwen3Torch, align
+from amd_decode.align import align
+from amd_decode.with_torch import Qwen3Torch
 
 
 class SameQwen3(Qwen3Torch):
@@ -42,6 +47,21 @@ class SameQwen3(Qwen3Torch):
         return x
 
 
+def run(model_dir, reference_cls, candidate_cls, tokens, *, device, dtype,
+        weight_bits, decode) -> bool:
+    reference = reference_cls(
+        model_dir, device=device, dtype=dtype, weight_bits=weight_bits
+    )
+    candidate = candidate_cls(
+        model_dir, device=device, dtype=dtype, weight_bits=weight_bits
+    )
+    kv = (
+        reference.make_kv_cache(len(tokens)),
+        candidate.make_kv_cache(len(tokens)),
+    )
+    return align(reference, candidate, kv, tokens, decode=decode)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", default="data/models/Qwen3-8B-Base")
@@ -53,7 +73,7 @@ def main() -> None:
                         default=[9707, 11, 1879, 13])
     args = parser.parse_args()
 
-    common = dict(
+    settings = dict(
         device=args.device,
         dtype=torch.float16,
         weight_bits=args.weight_bits,
@@ -61,13 +81,13 @@ def main() -> None:
     )
 
     print("== Qwen3Torch vs Qwen3Torch (sanity check) ==")
-    ok_self = align(
-        args.model_dir, Qwen3Torch, Qwen3Torch, args.tokens, **common
+    ok_self = run(
+        args.model_dir, Qwen3Torch, Qwen3Torch, args.tokens, **settings
     )
 
     print("\n== Qwen3Torch vs SameQwen3 (overridden _layer) ==")
-    ok_layer = align(
-        args.model_dir, Qwen3Torch, SameQwen3, args.tokens, **common
+    ok_layer = run(
+        args.model_dir, Qwen3Torch, SameQwen3, args.tokens, **settings
     )
 
     if not (ok_self and ok_layer):

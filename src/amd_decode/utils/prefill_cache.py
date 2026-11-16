@@ -17,10 +17,12 @@ K is quantized per (head, block, channel): ``k_scale`` has shape
 tensors and the scales may come with or without a leading batch dimension; the
 loader normalizes them.
 
-`SavedKVCacheView` adapts a saved cache to the ``KVCache`` protocol used by
-``Qwen3Torch.forward``. It deliberately does not retain dequantized layers:
-each layer is loaded, used, and released, so decoding a 256K context does not
-require all 36 layers' KV on the GPU at once.
+This module is the cross-implementation side of the saved-prefill path: any
+decode backend (the torch one in ``with_torch`` or a future kernel one) reads
+the same files.  ``layer()`` dequantises one layer to fp16 (the reference
+semantics, and the streaming path for huge contexts); ``layer_quantized()``
+returns the stored int8 values so an in-memory q8 cache can be seeded without
+a dequantise/re-quantise round trip.
 """
 
 from __future__ import annotations
@@ -31,6 +33,21 @@ from pathlib import Path
 import torch
 
 from .safetensor_io import SafeTensorsFile
+
+
+
+def expand_block_scale(k_scale: torch.Tensor, seq_len: int,
+                       block_size: int) -> torch.Tensor:
+    """[H, n_blocks, D] -> [H, seq_len, D], one scale vector per token block.
+
+    This is part of the prefill-cache format: K scales are stored per
+    (head, block, channel) and must be broadcast over the block's tokens.
+    """
+    expanded = k_scale.repeat_interleave(block_size, dim=1)[:, :seq_len, :]
+    if expanded.shape[1] < seq_len:
+        pad = expanded[:, -1:, :].expand(-1, seq_len - expanded.shape[1], -1)
+        expanded = torch.cat((expanded, pad), dim=1)
+    return expanded
 
 
 def _ensure_bhtd(tensor: torch.Tensor, name: str) -> torch.Tensor:
@@ -135,10 +152,7 @@ class SavedKVCache:
                 raise ValueError(f"unexpected k_scale shape {tuple(k_scale.shape)}")
             num_blocks = k_scale.shape[1]
             block_size = self.block_size or -(-seq_len // num_blocks)
-            k_scale = k_scale.repeat_interleave(block_size, dim=1)[:, :seq_len, :]
-            if k_scale.shape[1] < seq_len:
-                pad = k_scale[:, -1:, :].expand(-1, seq_len - k_scale.shape[1], -1)
-                k_scale = torch.cat((k_scale, pad), dim=1)
+            k_scale = expand_block_scale(k_scale, seq_len, block_size)
             k = k.to(device).float() * k_scale.unsqueeze(0)
 
             # V: [H, T, 1] per-token scale.
@@ -157,25 +171,29 @@ class SavedKVCache:
         return k.to(dtype), v.to(dtype)
 
 
-class SavedKVCacheView:
-    """Read-only adapter exposing a ``SavedKVCache`` as a decode cache."""
+    def layer_quantized(
+        self, layer_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the stored q8 K/V and scales *without* dequantising.
 
-    def __init__(
-        self,
-        cache: SavedKVCache,
-        device: str | torch.device = "cuda",
-        dtype: torch.dtype = torch.float16,
-    ) -> None:
-        self.cache = cache
-        self.device = device
-        self.dtype = dtype
-        self.length = cache.seq_len
+        Shapes after normalisation:
+          * ``k_q``, ``v_q``: int8 ``[1, H, T, D]`` (memory-mapped views);
+          * ``k_scale``: float32 ``[H, n_blocks, D]``;
+          * ``v_scale``: float32 ``[H, T, 1]``.
 
-    def append(
-        self, layer_idx: int, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        k_saved, v_saved = self.cache.layer(layer_idx, self.device, self.dtype)
-        return (
-            torch.cat((k_saved, k), dim=-2),
-            torch.cat((v_saved, v), dim=-2),
-        )
+        This keeps the prefill machine's quantisation intact, which is what a
+        host-resident q8 cache should store.
+        """
+        f = self._file(f"layer_{layer_idx:02d}")
+        keys = set(f.keys())
+        needed = {"k_q", "v_q", "k_scale", "v_scale"}
+        if not needed <= keys:
+            raise ValueError(
+                f"layer file is not q8 (need {sorted(needed)}): {f.path}"
+            )
+        k_q = _ensure_bhtd(f.get("k_q"), "k_q")
+        v_q = _ensure_bhtd(f.get("v_q"), "v_q")
+        k_scale = _k_scale_to_hbd(f.get("k_scale").float())
+        v_scale = _v_scale_to_ht1(f.get("v_scale").float())
+        return k_q, k_scale, v_q, v_scale
+

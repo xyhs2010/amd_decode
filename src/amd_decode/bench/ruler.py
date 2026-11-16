@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from ..with_torch.kv_cache_file import SavedKVCache
+from ..utils.prefill_cache import SavedKVCache
 from .types import EvalSample
 
 

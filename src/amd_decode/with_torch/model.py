@@ -17,29 +17,13 @@ import torch.nn.functional as F
 
 from .config import Qwen3Config
 from .int4 import dequantize_int4, quantize_int4
+from .kv_cache import KVCache
 from .rope import apply_rope, build_cos_sin, rope_parameters
 from .weights import Qwen3Weights
 
-
-class KVCache:
-    """Per-layer K/V cache, each of shape [B, H_kv, T, D]."""
-
-    def __init__(self, num_layers: int) -> None:
-        self.k: list[torch.Tensor | None] = [None] * num_layers
-        self.v: list[torch.Tensor | None] = [None] * num_layers
-        self.length = 0
-
-    def append(
-        self, layer_idx: int, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.k[layer_idx] is None:
-            self.k[layer_idx] = k
-            self.v[layer_idx] = v
-        else:
-            self.k[layer_idx] = torch.cat((self.k[layer_idx], k), dim=-2)
-            self.v[layer_idx] = torch.cat((self.v[layer_idx], v), dim=-2)
-        self.length = self.k[layer_idx].shape[-2]
-        return self.k[layer_idx], self.v[layer_idx]
+# Sentinel for "use the cache attached with set_kv_cache"; an explicit
+# ``kv=None`` still means the cache-less branch.
+_ATTACHED = object()
 
 
 class Qwen3Torch:
@@ -68,6 +52,42 @@ class Qwen3Torch:
 
         self.inv_freq, self.attention_scaling = rope_parameters(self.cfg)
         self.num_layers = self.cfg.num_hidden_layers
+
+        # DecodeModel protocol state (see amd_decode.align).
+        self._kv = None
+        self._hook = None
+        self._features: dict[int, object] = {}
+
+    # ------------------------------------------------------------- align protocol
+
+    def set_kv_cache(self, kv) -> None:
+        """Attach the cache ``forward`` uses when ``kv`` is not passed."""
+        self._kv = kv
+
+    def set_hook(self, hook) -> None:
+        """Install ``hook(layer_idx, output)``, called after every layer.
+
+        The hook's return value is what :meth:`get_features` reports for that
+        layer, so a hook that copies to CPU keeps VRAM bounded.
+        """
+        self._hook = hook
+
+    def get_features(self) -> dict[int, object]:
+        """Layer features captured by the most recent :meth:`forward`."""
+        return self._features
+
+    def make_kv_cache(self, max_len: int, batch_size: int = 1) -> KVCache:
+        """Allocate the int8 KV cache; ``with_host`` overrides the storage."""
+        if self.dtype is not torch.float16:
+            raise ValueError("the q8 KV cache dequantises to float16")
+        return KVCache(
+            self.num_layers,
+            max_len=max_len,
+            num_kv_heads=self.cfg.num_key_value_heads,
+            head_dim=self.cfg.head_dim,
+            batch_size=batch_size,
+            device=self.device,
+        )
 
     # ------------------------------------------------------------------ internals
 
@@ -190,7 +210,7 @@ class Qwen3Torch:
     def forward(
         self,
         input_ids: torch.Tensor | list[int],
-        kv: KVCache | None = None,
+        kv=_ATTACHED,
         position_offset: int = 0,
         logits_to_keep: int | None = None,
     ) -> torch.Tensor:
@@ -199,13 +219,17 @@ class Qwen3Torch:
         Args:
             input_ids: [T] or [B, T] token ids.
             kv: optional cache. When given, new K/V are appended and attention
-                runs over the whole cache.
+                runs over the whole cache. Omit to use the cache attached with
+                :meth:`set_kv_cache`; pass ``None`` for no cache.
             position_offset: absolute position of the first input token.
             logits_to_keep: if set, only return the last N positions' logits.
 
         Returns:
             logits of shape [B, T, vocab] (or [B, N, vocab]).
         """
+        if kv is _ATTACHED:
+            kv = self._kv
+        self._features = {}
         ids = torch.as_tensor(input_ids, dtype=torch.long)
         if ids.dim() == 1:
             ids = ids[None, :]
@@ -227,6 +251,8 @@ class Qwen3Torch:
         for layer_idx in range(self.num_layers):
             p = self._load_layer(layer_idx)
             x = self._layer(x, p, cos, sin, kv, layer_idx, past)
+            if self._hook is not None:
+                self._features[layer_idx] = self._hook(layer_idx, x)
             del p
 
         x = self._rms(x, self.final_norm.to(self.device).to(self.dtype))

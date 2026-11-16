@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 
-from .safetensor_io import SafeTensorsFile
+from ..utils.safetensor_io import SafeTensorsFile
 
 LAYER_TENSORS = (
     "input_layernorm.weight",
