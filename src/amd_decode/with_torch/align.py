@@ -9,6 +9,10 @@ override ``_layer``; nothing in ``model.py`` needs to change::
 
     ok = align("Qwen3-8B", Qwen3Torch, MyQwen3, tokens=[1, 2, 3])
 
+A candidate that defines ``make_kv_cache(total_len)`` gets that cache for the
+run instead of the default device ``KVCache``; the reference keeps the device
+cache, so alternative cache backends are compared on equal terms.
+
 The implementation temporarily wraps ``_layer`` on both instances, so it can
 compare the output of *every* layer (and the final logits) instead of only the
 end result. That makes a mismatch point at the layer that caused it.
@@ -102,8 +106,20 @@ def _chunks(tokens, decode: bool) -> list[list[int]]:
     return [[tok] for tok in ids] if decode else [ids]
 
 
+def _make_cache(model, chunks: list[list[int]]):
+    """A model may supply its own cache through ``make_kv_cache(total_len)``.
+
+    That is how alternative cache backends (e.g. host-resident K/V) are
+    exercised: the reference model keeps the default device ``KVCache``.
+    """
+    factory = getattr(model, "make_kv_cache", None)
+    if factory is None:
+        return KVCache(model.num_layers)
+    return factory(sum(len(chunk) for chunk in chunks))
+
+
 def _run(model, chunks: list[list[int]], use_kv: bool) -> list[_Step]:
-    kv = KVCache(model.num_layers) if use_kv else None
+    kv = _make_cache(model, chunks) if use_kv else None
     steps: list[_Step] = []
     position = 0
     for chunk in chunks:
