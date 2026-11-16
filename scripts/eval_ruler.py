@@ -93,20 +93,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--model-dir", default="data/models/Qwen3-8B-Base")
     parser.add_argument("--kv-root", default="data/kv_cache")
     parser.add_argument("--ruler-root", default="data/raw/ruler")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--impl",
-        choices=("device", "host"),
-        default="device",
-        help="q8 KV cache in VRAM (device) or pinned host memory (host, no VRAM)",
-    )
-    parser.add_argument(
-        "--weight-bits",
-        type=int,
-        default=4,
-        choices=(4, 16),
-        help="Qwen3Torch weight quantization (the caches were built with w4)",
-    )
+    parser.add_argument("--impl", default="device", help="Impl decoder")
     parser.add_argument(
         "--lengths",
         type=_parse_lengths,
@@ -198,8 +185,7 @@ def main(argv: list[str] | None = None) -> None:
     print(
         f"eval_ruler: {len(samples)} sample(s), {len(remaining)} to run "
         f"({len(existing)} cached result(s) loaded), "
-        f"impl={args.impl}, device={args.device}, "
-        f"weight_bits={args.weight_bits}"
+        f"impl={args.impl}"
     )
     if args.max_new_tokens is not None:
         print(
@@ -211,14 +197,16 @@ def main(argv: list[str] | None = None) -> None:
     if remaining:
         if args.impl == "device":
             decoder = Qwen3Torch(
-                args.model_dir, device=args.device, dtype=torch.float16,
-                weight_bits=args.weight_bits,
+                args.model_dir, device="cuda", dtype=torch.float16,
+                weight_bits=4,
+            )
+        elif args.impl == "host":
+            decoder = HostQwen3(
+                args.model_dir, device="cuda", dtype=torch.float16,
+                weight_bits=4,
             )
         else:
-            decoder = HostQwen3(
-                args.model_dir, device=args.device, dtype=torch.float16,
-                weight_bits=args.weight_bits,
-            )
+            raise Exception(f"No impl f{args.impl}")
 
         previous_kv = None
 
@@ -247,7 +235,6 @@ def main(argv: list[str] | None = None) -> None:
                 old.free()
 
         config = EvalConfig(
-            device=args.device,
             max_new_tokens=args.max_new_tokens,
             verbose=not args.quiet,
         )

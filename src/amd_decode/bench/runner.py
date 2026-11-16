@@ -17,18 +17,10 @@ from .types import EvalReport, EvalSample, SampleResult
 class EvalConfig:
     """Evaluation knobs. There is deliberately no timing/throughput here."""
 
-    device: str | torch.device | None = None
     #: Override every sample's ``max_new_tokens`` (debug only; changes scores).
     max_new_tokens: int | None = None
     empty_cache: bool = True
     verbose: bool = True
-
-
-def _resolve_device(decoder, configured) -> torch.device:
-    device = configured if configured is not None else getattr(decoder, "device", None)
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    return torch.device(device)
 
 
 def _preview(text: str, limit: int = 90) -> str:
@@ -53,7 +45,6 @@ def evaluate(
     resume a long run.
     """
     config = config or EvalConfig()
-    device = _resolve_device(decoder, config.device)
     samples = list(samples)
     if not samples:
         raise ValueError("samples must not be empty")
@@ -98,7 +89,7 @@ def evaluate(
                 f"{sample.sample_id.rsplit('_', 1)[-1]}: "
                 f"score={score:.2f} pred={_preview(prediction.text)!r}"
             )
-        if config.empty_cache and device.type == "cuda":
+        if config.empty_cache and getattr(decoder, "device") == "cuda":
             torch.cuda.empty_cache()
 
     return report
