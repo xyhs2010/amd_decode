@@ -20,6 +20,9 @@ skip it.
 
 We only reproduce the qparams and the dequantized weights; the CUDA-only
 ``_convert_weight_to_int4pack`` bit layout is irrelevant for a torch GEMV.
+
+:func:`pack_int4` / :func:`unpack_int4` are a storage codec for the cache: the
+q values are 0..15, so two fit per byte with no change to the dequant maths.
 """
 
 from __future__ import annotations
@@ -65,6 +68,28 @@ def quantize_int4(
     ).clamp(0, QMAX)
 
     return q.to(torch.int8).view(out_features, in_features), scale, zero
+
+
+def pack_int4(q: torch.Tensor) -> torch.Tensor:
+    """Pack int8 q (values 0..15) two per byte along the last dim.
+
+    Returns uint8 ``[..., in // 2]``; the even index is the low nibble.
+    """
+    if q.shape[-1] % 2:
+        raise ValueError(f"last dim {q.shape[-1]} is odd; cannot pack int4")
+    u = q.to(torch.uint8)
+    return (u[..., 0::2] | (u[..., 1::2] << 4)).contiguous()
+
+
+def unpack_int4(packed: torch.Tensor, in_features: int) -> torch.Tensor:
+    """Inverse of :func:`pack_int4`; returns int8 ``[..., in_features]``."""
+    u = packed.to(torch.uint8)
+    out = torch.empty(u.shape[:-1] + (in_features,), dtype=torch.uint8,
+                      device=u.device)
+    out[..., 0::2] = u & 0x0F
+    out[..., 1::2] = u >> 4
+    # Values are 0..15, so the uint8 and int8 bit patterns agree.
+    return out.view(torch.int8)
 
 
 def dequantize_int4(

@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from .. import DecodeModel
 from .config import Qwen3Config
-from .int4 import dequantize_int4, quantize_int4
+from .int4 import dequantize_int4, pack_int4, quantize_int4, unpack_int4
 from .kv_cache import KVCache
 from .rope import apply_rope, build_cos_sin, rope_parameters
 from .weights import Qwen3Weights
@@ -42,7 +42,9 @@ class Qwen3Torch(DecodeModel):
         self.dtype = dtype
         self.weight_bits = weight_bits
         self.weights = Qwen3Weights(model_dir)
-        # name -> (q, scale, zero) on CPU, computed once per weight.
+        # name -> (packed q, scale, zero) on the GPU, computed once per weight.
+        # Packed q is half the int8 size and is read every step, so keeping it
+        # on the device avoids streaming ~3.5 GiB per step over PCIe.
         self._int4_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
         # Kept on CPU: embedding lookup only touches a few rows, and lm_head is
@@ -108,12 +110,18 @@ class Qwen3Torch(DecodeModel):
             return self._to_gpu(tensor)
         try:
             if name not in self._int4_cache:
-                self._int4_cache[name] = quantize_int4(tensor)
+                q, scale, zero = quantize_int4(tensor)
+                self._int4_cache[name] = (
+                    pack_int4(q).to(self.device),
+                    scale.to(self.device),
+                    zero.to(self.device),
+                )
         except ValueError:
             # Same behaviour as torchao: skip weights whose in_features is not
             # divisible by the group size.
             return self._to_gpu(tensor)
         q, scale, zero = self._int4_cache[name]
+        q = unpack_int4(q, q.shape[-1] * 2)
         return dequantize_int4(q, scale, zero, device=self.device, dtype=self.dtype)
 
     def _load_layer(self, layer_idx: int) -> dict[str, torch.Tensor]:
