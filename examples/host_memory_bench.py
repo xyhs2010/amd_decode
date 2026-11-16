@@ -15,9 +15,9 @@ Two things bite:
 * Bulk ``copy_`` (DMA path) is fast in both directions (~12 GB/s); only
   element-wise store kernels are affected by the coherent/non-coherent flag.
 
-Run from the repo root (no ``PYTHONPATH`` needed):
+Run from the repo root with ``src`` on the path:
 
-    .venv/bin/python examples/host_memory_bench.py
+    PYTHONPATH=src .venv/bin/python examples/host_memory_bench.py
 
 The wrapper uses private torch APIs (``_construct_storage_from_data_pointer``,
 also used by torch.compile's cudagraph trees) because there is no public way to
@@ -28,160 +28,20 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import math
 import time
 
 import torch
 
-HIP_LIBRARY = "/opt/rocm/lib/libamdhip64.so"
-
-HIP_HOST_MALLOC_MAPPED = 0x2
-HIP_HOST_MALLOC_WRITE_COMBINED = 0x4
-HIP_HOST_MALLOC_COHERENT = 0x40000000
-HIP_HOST_MALLOC_NON_COHERENT = 0x80000000
-HIP_HOST_REGISTER_MAPPED = 0x2
-HIP_MEM_ATTACH_GLOBAL = 0x1
-
-# Best default for a buffer the GPU both reads and writes (KV cache).
-HOST_MALLOC_FLAGS = HIP_HOST_MALLOC_MAPPED | HIP_HOST_MALLOC_NON_COHERENT
-
-
-class Hip:
-    """Minimal ctypes binding for the HIP host-memory entry points."""
-
-    def __init__(self, path: str = HIP_LIBRARY) -> None:
-        self.lib = ctypes.CDLL(path)
-        lib = self.lib
-        lib.hipGetErrorString.argtypes = [ctypes.c_int]
-        lib.hipGetErrorString.restype = ctypes.c_char_p
-        lib.hipHostMalloc.argtypes = [
-            ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint
-        ]
-        lib.hipHostMalloc.restype = ctypes.c_int
-        lib.hipHostFree.argtypes = [ctypes.c_void_p]
-        lib.hipHostFree.restype = ctypes.c_int
-        lib.hipHostGetDevicePointer.argtypes = [
-            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint
-        ]
-        lib.hipHostGetDevicePointer.restype = ctypes.c_int
-        lib.hipHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
-        lib.hipHostRegister.restype = ctypes.c_int
-        lib.hipHostUnregister.argtypes = [ctypes.c_void_p]
-        lib.hipHostUnregister.restype = ctypes.c_int
-        lib.hipMallocManaged.argtypes = [
-            ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint
-        ]
-        lib.hipMallocManaged.restype = ctypes.c_int
-        lib.hipFree.argtypes = [ctypes.c_void_p]
-        lib.hipFree.restype = ctypes.c_int
-
-    def _check(self, rc: int, what: str) -> None:
-        if rc != 0:
-            msg = self.lib.hipGetErrorString(rc).decode()
-            raise RuntimeError(f"{what} failed: {msg} (rc={rc})")
-
-    def host_malloc(self, nbytes: int, flags: int = HOST_MALLOC_FLAGS) -> int:
-        ptr = ctypes.c_void_p()
-        self._check(
-            self.lib.hipHostMalloc(ctypes.byref(ptr), nbytes, ctypes.c_uint(flags)),
-            "hipHostMalloc",
-        )
-        return ptr.value
-
-    def host_free(self, ptr: int) -> None:
-        self._check(self.lib.hipHostFree(ctypes.c_void_p(ptr)), "hipHostFree")
-
-    def host_device_pointer(self, host_ptr: int) -> int:
-        dev = ctypes.c_void_p()
-        self._check(
-            self.lib.hipHostGetDevicePointer(
-                ctypes.byref(dev), ctypes.c_void_p(host_ptr), ctypes.c_uint(0)
-            ),
-            "hipHostGetDevicePointer",
-        )
-        return dev.value
-
-    def host_register(self, host_ptr: int, nbytes: int,
-                      flags: int = HIP_HOST_REGISTER_MAPPED) -> None:
-        self._check(
-            self.lib.hipHostRegister(
-                ctypes.c_void_p(host_ptr), nbytes, ctypes.c_uint(flags)
-            ),
-            "hipHostRegister",
-        )
-
-    def host_unregister(self, host_ptr: int) -> None:
-        self._check(
-            self.lib.hipHostUnregister(ctypes.c_void_p(host_ptr)), "hipHostUnregister"
-        )
-
-    def malloc_managed(self, nbytes: int) -> int:
-        ptr = ctypes.c_void_p()
-        self._check(
-            self.lib.hipMallocManaged(
-                ctypes.byref(ptr), nbytes, ctypes.c_uint(HIP_MEM_ATTACH_GLOBAL)
-            ),
-            "hipMallocManaged",
-        )
-        return ptr.value
-
-    def free(self, ptr: int) -> None:
-        self._check(self.lib.hipFree(ctypes.c_void_p(ptr)), "hipFree")
+from amd_decode.with_host.host_memory import (
+    HIP_HOST_MALLOC_MAPPED,
+    HostBuffer,
+    Hip,
+    as_cuda_view,
+)
 
 
 def _itemsize(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
-
-
-def as_cuda_view(ptr: int, shape: tuple[int, ...], dtype: torch.dtype,
-                 device: torch.device) -> torch.Tensor:
-    """Build a CUDA tensor over a raw device pointer (no ownership, no copy)."""
-    if not hasattr(torch._C, "_construct_storage_from_data_pointer"):
-        raise RuntimeError("torch has no _construct_storage_from_data_pointer")
-    nbytes = math.prod(shape) * _itemsize(dtype)
-    strides = []
-    acc = 1
-    for size in reversed(shape):
-        strides.append(acc)
-        acc *= size
-    strides.reverse()
-
-    storage = torch._C._construct_storage_from_data_pointer(ptr, device, nbytes)
-    meta = {
-        "nbytes": nbytes,
-        "data_ptr": ptr,
-        "size": tuple(shape),
-        "stride": tuple(strides),
-        "dtype": dtype,
-        "device": device,
-        "storage_offset": 0,
-    }
-    return torch._C._construct_CUDA_Tensor_From_Storage_And_Metadata(meta, storage)
-
-
-class HostBuffer:
-    """A HIP host allocation exposed as both a CPU and a CUDA tensor.
-
-    ``cuda`` is what kernels use: the data stays in host RAM, so every access
-    goes over PCIe.  ``cpu`` is a zero-copy CPU view used to initialise and
-    verify the contents.  Do not touch ``cpu`` while kernels are in flight.
-    """
-
-    def __init__(self, hip: Hip, numel: int, dtype: torch.dtype,
-                 device: torch.device, flags: int = HOST_MALLOC_FLAGS) -> None:
-        self.hip = hip
-        self.nbytes = numel * _itemsize(dtype)
-        self.ptr = hip.host_malloc(self.nbytes, flags)
-        # Keep the ctypes buffer alive so torch.frombuffer stays valid.
-        self._cpu_buffer = (ctypes.c_char * self.nbytes).from_address(self.ptr)
-        self.cpu = torch.frombuffer(self._cpu_buffer, dtype=dtype)
-        self.cuda = as_cuda_view(self.ptr, (numel,), dtype, device)
-        self._freed = False
-
-    def free(self) -> None:
-        if not self._freed:
-            self.hip.host_free(self.ptr)
-            self._freed = True
 
 
 class Variant:
