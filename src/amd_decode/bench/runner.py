@@ -7,7 +7,8 @@ from typing import Callable, Iterable, Optional
 
 import torch
 
-from .generate import DecodeBackend, generate, resolve_device_dtype
+from .. import DecodeModel
+from .generate import generate
 from .metrics import get_metric
 from .types import EvalReport, EvalSample, SampleResult
 
@@ -17,11 +18,17 @@ class EvalConfig:
     """Evaluation knobs. There is deliberately no timing/throughput here."""
 
     device: str | torch.device | None = None
-    dtype: torch.dtype | None = None
     #: Override every sample's ``max_new_tokens`` (debug only; changes scores).
     max_new_tokens: int | None = None
     empty_cache: bool = True
     verbose: bool = True
+
+
+def _resolve_device(decoder, configured) -> torch.device:
+    device = configured if configured is not None else getattr(decoder, "device", None)
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    return torch.device(device)
 
 
 def _preview(text: str, limit: int = 90) -> str:
@@ -30,20 +37,23 @@ def _preview(text: str, limit: int = 90) -> str:
 
 
 def evaluate(
-    decoder: DecodeBackend,
+    decoder: DecodeModel,
     tokenizer,
     samples: Iterable[EvalSample],
     *,
     config: EvalConfig | None = None,
+    prepare: Optional[Callable[[EvalSample], None]] = None,
     on_result: Optional[Callable[[SampleResult], None]] = None,
 ) -> EvalReport:
     """Greedy-decode and score every sample.
 
-    ``on_result`` is called after each sample, which lets a script append
-    results to disk and resume a long run.
+    ``prepare(sample)`` is called before each sample and is where the caller
+    attaches that sample's cache (``decoder.set_kv_cache(...)``).  ``on_result``
+    is called after each sample, which lets a script append results to disk and
+    resume a long run.
     """
     config = config or EvalConfig()
-    device, dtype = resolve_device_dtype(decoder, config.device, config.dtype)
+    device = _resolve_device(decoder, config.device)
     samples = list(samples)
     if not samples:
         raise ValueError("samples must not be empty")
@@ -52,13 +62,13 @@ def evaluate(
     report = EvalReport(benchmark=benchmarks.pop() if len(benchmarks) == 1 else "mixed")
 
     for index, sample in enumerate(samples, start=1):
+        if prepare is not None:
+            prepare(sample)
         try:
             prediction = generate(
                 decoder,
                 tokenizer,
                 sample,
-                device=device,
-                dtype=dtype,
                 max_new_tokens=config.max_new_tokens,
             )
         except torch.cuda.OutOfMemoryError as exc:

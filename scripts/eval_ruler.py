@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Accuracy (not speed) evaluation of Qwen3Torch on RULER saved KV caches.
+"""Accuracy (not speed) evaluation of a decode backend on RULER saved caches.
 
 Run from the repo root (the package is not installed into the venv)::
 
@@ -40,7 +40,14 @@ from amd_decode.bench import (
     evaluate,
     load_ruler_samples,
 )
+from amd_decode.utils.prefill_cache import SavedKVCache
+from amd_decode.with_host import HostQwen3
 from amd_decode.with_torch import Qwen3Torch
+
+# The seeded cache is resident for the whole sample. 256K needs ~18.6 GiB
+# (VRAM for the torch backend, host RAM for the host backend); we do not
+# support that length here.
+MAX_KV_LEN = 131072
 
 
 def _parse_lengths(value: str) -> list[int] | None:
@@ -58,10 +65,6 @@ def _parse_list(value: str | None) -> list[str] | None:
     if value is None:
         return None
     return [part for part in value.replace(",", " ").split() if part]
-
-
-def _parse_dtype(value: str) -> torch.dtype:
-    return {"float16": torch.float16, "bfloat16": torch.bfloat16}[value]
 
 
 def _load_existing(path: Path) -> dict[str, SampleResult]:
@@ -91,7 +94,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--kv-root", default="data/kv_cache")
     parser.add_argument("--ruler-root", default="data/raw/ruler")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
+    parser.add_argument(
+        "--impl",
+        choices=("device", "host"),
+        default="device",
+        help="q8 KV cache in VRAM (device) or pinned host memory (host, no VRAM)",
+    )
     parser.add_argument(
         "--weight-bits",
         type=int,
@@ -185,13 +193,12 @@ def main(argv: list[str] | None = None) -> None:
 
     output_path = Path(args.output)
     existing = _load_existing(output_path) if args.resume else {}
-    selected_ids = {sample.sample_id for sample in samples}
     remaining = [sample for sample in samples if sample.sample_id not in existing]
 
     print(
         f"eval_ruler: {len(samples)} sample(s), {len(remaining)} to run "
         f"({len(existing)} cached result(s) loaded), "
-        f"device={args.device}, dtype={args.dtype}, "
+        f"impl={args.impl}, device={args.device}, "
         f"weight_bits={args.weight_bits}"
     )
     if args.max_new_tokens is not None:
@@ -202,15 +209,45 @@ def main(argv: list[str] | None = None) -> None:
 
     new_results: list[SampleResult] = []
     if remaining:
-        decoder = Qwen3Torch(
-            args.model_dir,
-            device=args.device,
-            dtype=_parse_dtype(args.dtype),
-            weight_bits=args.weight_bits,
-        )
+        if args.impl == "device":
+            decoder = Qwen3Torch(
+                args.model_dir, device=args.device, dtype=torch.float16,
+                weight_bits=args.weight_bits,
+            )
+        else:
+            decoder = HostQwen3(
+                args.model_dir, device=args.device, dtype=torch.float16,
+                weight_bits=args.weight_bits,
+            )
+
+        previous_kv = None
+
+        def prepare(sample) -> None:
+            """Seed a fresh q8 cache for this sample and attach it."""
+            nonlocal previous_kv
+            saved = SavedKVCache(sample.cache_path)
+            if saved.seq_len > MAX_KV_LEN:
+                raise SystemExit(
+                    f"{sample.sample_id}: seq_len {saved.seq_len} exceeds "
+                    f"{MAX_KV_LEN}; 256K contexts are not supported"
+                )
+            prefix_len = len(
+                tokenizer.encode(sample.answer_prefix, add_special_tokens=False)
+            )
+            budget = (
+                sample.max_new_tokens
+                if args.max_new_tokens is None
+                else args.max_new_tokens
+            )
+            kv = decoder.make_kv_cache(saved.seq_len + prefix_len + budget + 1)
+            kv.seed_from_prefill(saved)
+            old, previous_kv = previous_kv, kv
+            decoder.set_kv_cache(kv)
+            if old is not None:
+                old.free()
+
         config = EvalConfig(
             device=args.device,
-            dtype=_parse_dtype(args.dtype),
             max_new_tokens=args.max_new_tokens,
             verbose=not args.quiet,
         )
@@ -227,6 +264,7 @@ def main(argv: list[str] | None = None) -> None:
                 tokenizer,
                 remaining,
                 config=config,
+                prepare=prepare,
                 on_result=on_result,
             )
         new_results = report.results

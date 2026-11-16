@@ -5,12 +5,12 @@ A backend is any object implementing :class:`DecodeModel` - four operations:
 * ``set_kv_cache(kv)``: attach the cache ``forward`` should use;
 * ``set_hook(hook)``: call ``hook(layer_idx, output)`` after every layer; the
   hook's return value is the captured *feature* for that layer;
-* ``forward(input_ids, position_offset=0)``: run one pass, return logits;
+* ``forward(input_ids, position_offset=None)``: run one pass, return logits;
 * ``get_features()``: features captured during the most recent ``forward``.
 
-``Qwen3Torch`` implements this protocol directly.  A future kernel backend
-only has to provide the same four methods; ``align`` does not know anything
-else about it.
+The protocol is defined in ``amd_decode``.  ``Qwen3Torch`` implements it
+directly.  A future kernel backend only has to provide the same four methods;
+``align`` does not know anything else about it.
 
 ``align(reference, candidate, kv, tokens)`` runs both objects over the same
 tokens and compares every layer feature and the logits byte-for-byte.
@@ -32,24 +32,11 @@ short; exactness means identical raw bytes, not a numerical tolerance.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any
 
 import torch
 
-LayerHook = Callable[[int, torch.Tensor], Any]
-
-
-@runtime_checkable
-class DecodeModel(Protocol):
-    """The four operations ``align`` needs from a decode backend."""
-
-    def set_kv_cache(self, kv: Any) -> None: ...
-
-    def set_hook(self, hook: LayerHook | None) -> None: ...
-
-    def forward(self, input_ids, position_offset: int = 0) -> torch.Tensor: ...
-
-    def get_features(self) -> dict[int, Any]: ...
+from . import DecodeModel
 
 
 @dataclass
@@ -113,7 +100,7 @@ def _run(model, kv, chunks: list[list[int]]) -> list[_Step]:
     """Run the chunks, capturing every layer feature and the logits on CPU."""
     position = 0 if kv is None else kv.length
     model.set_kv_cache(kv)
-    model.set_hook(lambda layer_idx, out: out.detach().to("cpu"))
+    model.set_hook(lambda _, out: out.detach().to("cpu"))
     steps: list[_Step] = []
     try:
         for chunk in chunks:

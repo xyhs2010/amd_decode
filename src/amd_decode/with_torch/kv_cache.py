@@ -19,7 +19,7 @@ import math
 
 import torch
 
-from ..utils.prefill_cache import expand_block_scale
+from ..utils.prefill_cache import SavedKVCache, expand_block_scale
 
 
 def quantize_kv(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -141,6 +141,19 @@ class KVCache:
         self._block_size[layer_idx] = block_size
         self._prefix_len[layer_idx] = position + n
         self.seeded_len = max(self.seeded_len, position + n)
+
+    def seed_from_prefill(self, saved: SavedKVCache, position: int = 0) -> None:
+        """Seed the whole cache from a hydra_llm prefill directory."""
+        if saved.num_layers != self.num_layers:
+            raise ValueError(
+                f"cache has {self.num_layers} layers, prefill has {saved.num_layers}"
+            )
+        seq_len = saved.seq_len
+        for layer_idx in range(saved.num_layers):
+            k_q, k_scale, v_q, v_scale = saved.layer_quantized(layer_idx)
+            block = saved.block_size or -(-seq_len // k_scale.shape[1])
+            self.seed_layer(layer_idx, k_q, k_scale, v_q, v_scale, block, position)
+        self.set_length(position + seq_len)
 
     def set_length(self, length: int) -> None:
         if not 0 <= length <= self.max_len:

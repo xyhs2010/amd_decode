@@ -1,110 +1,28 @@
-"""Greedy generation on top of a saved dense-prefill KV cache.
+"""Greedy generation over whatever cache the decoder has attached.
 
-The evaluator only needs one method from a decode backend::
+The evaluator only needs :class:`amd_decode.DecodeModel`::
 
-    forward(input_ids, kv=None, position_offset=0) -> torch.Tensor
+    decoder.set_kv_cache(kv)          # done by the caller, per sample
+    decoder.forward(input_ids)        # starts at kv.length
 
-``Qwen3Torch`` satisfies it; a future kernel backend is expected to as well.
-The backend may expose ``device`` / ``dtype`` / ``num_layers`` attributes; they
-are picked up when present.
-
-Generation uses :class:`SavedPrefixKVCache`: it keeps the saved prefix on disk
-and grows an in-memory int8 tail for the answer prefix and generated tokens.
-The saved prefix's K/V is dequantized one layer at a time and released
-immediately, so no layer's full KV is kept resident across steps.
+The backend owns its cache; this module never constructs or inspects one.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Protocol, runtime_checkable
 
 import torch
 
-from ..with_torch.kv_cache import KVCache
-from ..utils.prefill_cache import SavedKVCache
+from .. import DecodeModel
 from .types import EvalSample, Prediction
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f]")
 
 
-@runtime_checkable
-class DecodeBackend(Protocol):
-    """The minimal decode interface needed by the evaluator."""
-
-    def forward(
-        self,
-        input_ids,
-        kv=None,
-        position_offset: int = 0,
-    ) -> torch.Tensor: ...
-
-
-class SavedPrefixKVCache:
-    """``KVCache`` protocol over a saved prefix plus a fixed-capacity int8 tail.
-
-    ``Qwen3Torch.forward`` checks ``kv.length == position_offset`` before the
-    layer loop, calls ``append(layer_idx, k, v)`` once per layer, and expects
-    the full K/V back. ``length`` is the saved prefix length plus however many
-    tokens the tail currently holds, so it grows automatically after a
-    forward pass.
-    """
-
-    def __init__(
-        self,
-        cache: SavedKVCache,
-        device: str | torch.device = "cuda",
-        dtype: torch.dtype = torch.float16,
-        tail_len: int = 256,
-    ) -> None:
-        if cache.num_layers < 1:
-            raise ValueError("saved cache has no layers")
-        self._cache = cache
-        self._device = device
-        self._dtype = dtype
-        self._prefix_len = cache.seq_len
-        self._tail = KVCache(
-            cache.num_layers,
-            max_len=tail_len,
-            num_kv_heads=int(cache.meta["num_kv_heads"]),
-            head_dim=int(cache.meta["head_dim"]),
-            device=device,
-        )
-
-    @property
-    def length(self) -> int:
-        return self._prefix_len + self._tail.length
-
-    def append(
-        self, layer_idx: int, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        prefix_k, prefix_v = self._cache.layer(layer_idx, self._device, self._dtype)
-        tail_k, tail_v = self._tail.append(layer_idx, k, v)
-        return (
-            torch.cat((prefix_k, tail_k), dim=-2),
-            torch.cat((prefix_v, tail_v), dim=-2),
-        )
-
-
 def postprocess_prediction(text: str) -> str:
     """RULER's ``postprocess_pred``: strip, then map control chars to newlines."""
     return _CONTROL_CHARS.sub("\n", text.strip()).strip()
-
-
-def resolve_device_dtype(
-    decoder: DecodeBackend,
-    device: str | torch.device | None = None,
-    dtype: torch.dtype | None = None,
-) -> tuple[torch.device, torch.dtype]:
-    if device is None:
-        device = getattr(decoder, "device", None)
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    if dtype is None:
-        dtype = getattr(decoder, "dtype", None)
-    if dtype is None:
-        dtype = torch.float16
-    return torch.device(device), dtype
 
 
 def _last_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -118,28 +36,17 @@ def _last_logits(logits: torch.Tensor) -> torch.Tensor:
 
 @torch.inference_mode()
 def generate(
-    decoder: DecodeBackend,
+    decoder: DecodeModel,
     tokenizer,
     sample: EvalSample,
     *,
-    device: str | torch.device | None = None,
-    dtype: torch.dtype | None = None,
     max_new_tokens: int | None = None,
 ) -> Prediction:
-    """Greedy-decode an answer after the saved prompt and ``answer_prefix``."""
-    device, dtype = resolve_device_dtype(decoder, device, dtype)
-    backend_layers = getattr(decoder, "num_layers", None)
+    """Greedy-decode an answer after the attached prefix and ``answer_prefix``.
 
-    cache = SavedKVCache(sample.cache_path)
-    if (
-        backend_layers is not None
-        and cache.num_layers != backend_layers
-    ):
-        raise ValueError(
-            f"{sample.sample_id}: cache has {cache.num_layers} layers, "
-            f"decoder has {backend_layers}"
-        )
-
+    The caller must have attached the cache with ``decoder.set_kv_cache``;
+    ``forward`` starts at that cache's ``length``.
+    """
     prefix_ids = tokenizer.encode(sample.answer_prefix, add_special_tokens=False)
     if not prefix_ids:
         raise ValueError(f"{sample.sample_id}: empty answer_prefix")
@@ -147,12 +54,9 @@ def generate(
     limit = sample.max_new_tokens if max_new_tokens is None else int(max_new_tokens)
     if limit < 1:
         raise ValueError(f"{sample.sample_id}: generation budget must be >= 1")
-    kv = SavedPrefixKVCache(
-        cache, device=device, dtype=dtype, tail_len=len(prefix_ids) + limit
-    )
 
     # The answer prefix is fed as one short prefill on top of the saved prompt.
-    logits = decoder.forward(prefix_ids, kv=kv, position_offset=kv.length)
+    logits = decoder.forward(prefix_ids)
     last = _last_logits(logits)
 
     generated: list[int] = []
@@ -169,7 +73,7 @@ def generate(
         if len(generated) >= limit:
             break
 
-        logits = decoder.forward([next_id], kv=kv, position_offset=kv.length)
+        logits = decoder.forward([next_id])
         last = _last_logits(logits)
 
     text = tokenizer.decode(generated, skip_special_tokens=True)

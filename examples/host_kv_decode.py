@@ -25,9 +25,9 @@ from pathlib import Path
 import torch
 
 from amd_decode.align import align
-from amd_decode.with_host import HostQwen3
-from amd_decode.with_torch import KVCache, Qwen3Torch
 from amd_decode.utils.prefill_cache import SavedKVCache
+from amd_decode.with_host import HostQwen3
+from amd_decode.with_torch import Qwen3Torch
 
 CONTEXT_LEN = 16384
 
@@ -45,14 +45,6 @@ def same_bytes(a: torch.Tensor, b: torch.Tensor) -> bool:
     return a.shape == b.shape and torch.equal(
         a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
     )
-
-
-def seed_q8(kv: KVCache, saved: SavedKVCache, seq_len: int) -> None:
-    for layer_idx in range(kv.num_layers):
-        k_q, k_scale, v_q, v_scale = saved.layer_quantized(layer_idx)
-        block = saved.block_size or -(-seq_len // k_scale.shape[1])
-        kv.seed_layer(layer_idx, k_q, k_scale, v_q, v_scale, block)
-    kv.set_length(seq_len)
 
 
 def time_decode(model, kv, token: int, steps: int) -> list[float]:
@@ -102,7 +94,7 @@ def main() -> None:
     print(f"start token : {start_token} at position {seq_len}", flush=True)
 
     t0 = time.perf_counter()
-    seed_q8(host_kv, saved, seq_len)
+    host_kv.seed_from_prefill(saved)
     torch.cuda.synchronize()
     print(f"seed host KV: {time.perf_counter() - t0:.2f} s")
 
@@ -111,7 +103,7 @@ def main() -> None:
                      weight_bits=4)
     ref._int4_cache = host._int4_cache
     dev_kv = ref.make_kv_cache(seq_len + args.steps + 1)  # VRAM, q8
-    seed_q8(dev_kv, saved, seq_len)
+    dev_kv.seed_from_prefill(saved)
 
     prefix_ok = 0
     for layer_idx in range(host.num_layers):

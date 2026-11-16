@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from .. import DecodeModel
 from .config import Qwen3Config
 from .int4 import dequantize_int4, quantize_int4
 from .kv_cache import KVCache
@@ -26,7 +27,7 @@ from .weights import Qwen3Weights
 _ATTACHED = object()
 
 
-class Qwen3Torch:
+class Qwen3Torch(DecodeModel):
     def __init__(
         self,
         model_dir: str | Path,
@@ -210,18 +211,19 @@ class Qwen3Torch:
     def forward(
         self,
         input_ids: torch.Tensor | list[int],
+        position_offset: int | None = None,
         kv=_ATTACHED,
-        position_offset: int = 0,
         logits_to_keep: int | None = None,
     ) -> torch.Tensor:
         """Run one forward pass.
 
         Args:
             input_ids: [T] or [B, T] token ids.
+            position_offset: absolute position of the first input token; ``None``
+                means "start at the attached cache's ``length``" (0 without one).
             kv: optional cache. When given, new K/V are appended and attention
                 runs over the whole cache. Omit to use the cache attached with
                 :meth:`set_kv_cache`; pass ``None`` for no cache.
-            position_offset: absolute position of the first input token.
             logits_to_keep: if set, only return the last N positions' logits.
 
         Returns:
@@ -229,6 +231,8 @@ class Qwen3Torch:
         """
         if kv is _ATTACHED:
             kv = self._kv
+        if position_offset is None:
+            position_offset = 0 if kv is None else kv.length
         self._features = {}
         ids = torch.as_tensor(input_ids, dtype=torch.long)
         if ids.dim() == 1:
