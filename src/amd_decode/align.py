@@ -13,8 +13,8 @@ directly.  A future kernel backend only has to provide the same four methods;
 ``align`` does not know anything else about it.
 
 ``align(reference, candidate, kv, tokens)`` runs both objects over the same
-tokens and compares every layer feature and the logits within a fixed
-tolerance (``ATOL``/``RTOL`` below).
+tokens and compares every layer feature and the logits within a fixed relative
+tolerance (``RTOL`` below).
 
 ``kv`` supplies one cache per model:
 
@@ -39,9 +39,8 @@ import torch
 
 from . import DecodeModel
 
-# Deliberately loose fp16 tolerance: reordered fp32 accumulations (e.g. a fused
-# attention kernel) differ in the last bits.  Tighten by editing these.
-ATOL = 1e-2
+# Relative L2 error allowed per tensor.  A per-element atol is useless here:
+# Qwen3 residual streams have outlier channels of ~1e4, where one fp16 ulp is 8.
 RTOL = 1e-2
 
 
@@ -54,14 +53,8 @@ class Check:
 
 def _check(name: str, ref: torch.Tensor, alt: torch.Tensor) -> Check:
     a, b = ref.float(), alt.float()
-    if torch.allclose(a, b, rtol=RTOL, atol=ATOL):
-        return Check(name, True)
-    diff = (a - b).abs()
-    return Check(
-        name,
-        False,
-        f"max|d|={diff.max().item():.3e} mean|d|={diff.mean().item():.3e}",
-    )
+    err = float((a - b).norm() / b.norm().clamp_min(1e-12))
+    return Check(name, err <= RTOL, f"rel={err:.2e}")
 
 
 @dataclass

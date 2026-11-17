@@ -10,5 +10,9 @@ dependencies = []
 amd-decode = "amd_decode:main"
 
 [build-system]
-requires = ["uv_build>=0.13.7,<0.14.0"]
-build-backend = "uv_build"  
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12", "ninja"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+build-dir = "build"
+wheel.packages = ["src/amd_decode"]  
