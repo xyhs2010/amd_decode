@@ -63,14 +63,10 @@ class KVCache:
 
         shape = (num_layers, batch_size, num_kv_heads, max_len, head_dim)
         scale_shape = (num_layers, batch_size, num_kv_heads, max_len, 1)
-        self.k_q, self._cpu_k = self._allocate(shape, torch.int8)
-        self.v_q, self._cpu_v = self._allocate(shape, torch.int8)
-        self.k_tail_scale, self._cpu_k_tail_scale = self._allocate(
-            scale_shape, torch.float32
-        )
-        self.v_scale, self._cpu_v_scale = self._allocate(
-            scale_shape, torch.float32
-        )
+        self.k_q = self._allocate(shape, torch.int8)
+        self.v_q = self._allocate(shape, torch.int8)
+        self.k_tail_scale = self._allocate(scale_shape, torch.float32)
+        self.v_scale = self._allocate(scale_shape, torch.float32)
 
         self._prefix_len = [0] * num_layers
         self._k_block_scale: list[torch.Tensor | None] = [None] * num_layers
@@ -80,16 +76,9 @@ class KVCache:
         self.seeded_len = 0
 
     def _allocate(self, shape: tuple[int, ...], dtype: torch.dtype):
-        """Return (CUDA view, CPU view or None) for a cache buffer.
-
-        ``HostKVCache`` overrides this to back the view with pinned host memory.
-        """
+        """Allocate one cache buffer; ``HostKVCache`` overrides the storage."""
         tensor = torch.empty(math.prod(shape), dtype=dtype, device=self.device)
-        return tensor.view(shape), None
-
-    @staticmethod
-    def _seed_dst(cpu_view, cuda_view):
-        return cuda_view if cpu_view is None else cpu_view
+        return tensor.view(shape)
 
     def free(self) -> None:
         """Release non-tensor storage; device buffers are freed by the GC."""
@@ -132,11 +121,9 @@ class KVCache:
                 f"capacity {self.max_len}"
             )
         sl = slice(position, position + n)
-        self._seed_dst(self._cpu_k, self.k_q)[layer_idx, :, :, sl].copy_(k_q)
-        self._seed_dst(self._cpu_v, self.v_q)[layer_idx, :, :, sl].copy_(v_q)
-        self._seed_dst(self._cpu_v_scale, self.v_scale)[layer_idx, :, :, sl].copy_(
-            v_scale.unsqueeze(0)
-        )
+        self.k_q[layer_idx, :, :, sl].copy_(k_q)
+        self.v_q[layer_idx, :, :, sl].copy_(v_q)
+        self.v_scale[layer_idx, :, :, sl].copy_(v_scale.unsqueeze(0))
         self._k_block_scale[layer_idx] = k_scale.contiguous()
         self._block_size[layer_idx] = block_size
         self._prefix_len[layer_idx] = position + n

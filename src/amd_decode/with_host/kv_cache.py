@@ -27,7 +27,7 @@ class HostKVCache(KVCache):
         buf = HostBuffer(self._hip, math.prod(shape), dtype, self.device,
                          flags=self._flags)
         self._owners.append(buf)
-        return buf.cuda.view(shape), buf.cpu.view(shape)
+        return buf.cuda.view(shape)
 
     def free(self) -> None:
         for buf in self._owners:
