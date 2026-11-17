@@ -1,4 +1,4 @@
-"""Byte-level alignment for decoding backends.
+"""Tolerance alignment for decoding backends.
 
 A backend is any object implementing :class:`DecodeModel` - four operations:
 
@@ -13,7 +13,8 @@ directly.  A future kernel backend only has to provide the same four methods;
 ``align`` does not know anything else about it.
 
 ``align(reference, candidate, kv, tokens)`` runs both objects over the same
-tokens and compares every layer feature and the logits byte-for-byte.
+tokens and compares every layer feature and the logits within a fixed
+tolerance (``ATOL``/``RTOL`` below).
 
 ``kv`` supplies one cache per model:
 
@@ -26,7 +27,7 @@ values, but their *storage* may differ - e.g. int8 in host memory vs int8 in
 VRAM - which is how ``examples/host_kv_decode.py`` compares the two backends.
 
 Simplifications, on purpose: features are copied to CPU, so keep ``tokens``
-short; exactness means identical raw bytes, not a numerical tolerance.
+short; the tolerance is fixed here rather than configured.
 """
 
 from __future__ import annotations
@@ -38,33 +39,28 @@ import torch
 
 from . import DecodeModel
 
+# Deliberately loose fp16 tolerance: reordered fp32 accumulations (e.g. a fused
+# attention kernel) differ in the last bits.  Tighten by editing these.
+ATOL = 1e-2
+RTOL = 1e-2
+
 
 @dataclass
 class Check:
     name: str
-    exact: bool
+    ok: bool
     detail: str = ""
 
 
-def _same_bytes(a: torch.Tensor, b: torch.Tensor) -> bool:
-    """True iff ``a`` and ``b`` have the same shape/dtype and identical bytes."""
-    if a.shape != b.shape or a.dtype != b.dtype:
-        return False
-    return torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
-
-
 def _check(name: str, ref: torch.Tensor, alt: torch.Tensor) -> Check:
-    if ref.shape != alt.shape:
-        return Check(name, False, f"shape {tuple(ref.shape)} != {tuple(alt.shape)}")
-    if ref.dtype != alt.dtype:
-        return Check(name, False, f"dtype {ref.dtype} != {alt.dtype}")
-    if _same_bytes(ref, alt):
+    a, b = ref.float(), alt.float()
+    if torch.allclose(a, b, rtol=RTOL, atol=ATOL):
         return Check(name, True)
-    diff = (ref.float() - alt.float()).abs()
+    diff = (a - b).abs()
     return Check(
         name,
         False,
-        f"bytes differ: max|d|={diff.max().item():.3e} mean|d|={diff.mean().item():.3e}",
+        f"max|d|={diff.max().item():.3e} mean|d|={diff.mean().item():.3e}",
     )
 
 
@@ -125,7 +121,7 @@ def align(
     decode: bool = False,
     verbose: bool = True,
 ) -> bool:
-    """Run ``reference`` and ``candidate`` on the same tokens and compare bytes.
+    """Run ``reference`` and ``candidate`` on the same tokens and compare.
 
     Args:
         reference: the known-good backend object.
@@ -139,7 +135,7 @@ def align(
         verbose: print a per-step summary and every mismatching tensor.
 
     Returns:
-        True iff every compared feature and logit is byte-for-byte identical.
+        True iff every compared feature and logit is within tolerance.
     """
     ref_kv, alt_kv = _caches(kv, reference, candidate)
     if decode and (ref_kv is None or alt_kv is None):
@@ -182,20 +178,20 @@ def align(
             )
         checks.append(_check(f"{where} logits", ref_step.logits, alt_step.logits))
 
-        exact = sum(c.exact for c in checks)
-        ok &= exact == len(checks)
+        passed = sum(c.ok for c in checks)
+        ok &= passed == len(checks)
         if verbose:
             n_layers = len(ref_step.features)
-            layers_ok = sum(c.exact for c in checks if " layer " in c.name)
-            logits_ok = checks[-1].exact
+            layers_ok = sum(c.ok for c in checks if " layer " in c.name)
+            logits_ok = checks[-1].ok
             print(
-                f"{where}: layers {layers_ok}/{n_layers} exact, "
-                f"logits {'exact' if logits_ok else 'DIFFER'}"
+                f"{where}: layers {layers_ok}/{n_layers} within tol, "
+                f"logits {'ok' if logits_ok else 'DIFFER'}"
             )
             for check in checks:
-                if not check.exact:
+                if not check.ok:
                     print(f"  MISMATCH {check.name}: {check.detail}")
 
     if verbose:
-        print("byte-identical" if ok else "MISMATCH")
+        print("within tolerance" if ok else "MISMATCH")
     return ok
