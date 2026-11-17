@@ -8,5 +8,8 @@ set(CMAKE_CXX_STANDARD 17)
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 
-pybind11_add_module(_ops MODULE src/amd_decode/with_hip/hip/int4_gemv.hip)
+pybind11_add_module(_ops MODULE
+  src/amd_decode/with_hip/hip/int4_gemv.hip
+  src/amd_decode/with_hip/hip/attn.hip
+  src/amd_decode/with_hip/hip/bindings.hip)
 install(TARGETS _ops LIBRARY DESTINATION amd_decode/with_hip)

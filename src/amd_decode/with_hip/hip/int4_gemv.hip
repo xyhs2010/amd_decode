@@ -15,7 +15,6 @@
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#include <pybind11/pybind11.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -81,8 +80,4 @@ void q4_matmul(uintptr_t x, uintptr_t q, uintptr_t scale, uintptr_t zero,
       static_cast<int>(k));
   hipError_t err = hipGetLastError();
   if (err != hipSuccess) throw std::runtime_error(hipGetErrorString(err));
-}
-
-PYBIND11_MODULE(_ops, m) {
-  m.def("q4_matmul", &q4_matmul, "int4 weight GEMV");
 }
