@@ -1,10 +1,13 @@
 // Sparse int8 KV decode attention for Qwen3-8B (32 query / 8 KV heads, D=128).
 //
-// A copy of ``with_hip/hip/attn.hip`` that attends a per-head list of token ids
-// instead of the contiguous ``[0, n)`` range, so a policy can pick any subset.
-// ``-1`` marks padding and is skipped.  Dequantisation, the per-block K scales
-// of the seeded prefix, the online softmax and the partial/merge split are the
-// dense kernel's.
+// A copy of ``with_hip/hip/attn.hip`` that attends a per-query-head list of
+// token ids instead of the contiguous ``[0, n)`` range, so a policy can pick any
+// subset for every head.  ``-1`` marks padding and is skipped.
+//
+// One CTA owns one query head; the 4 query heads sharing a K/V head therefore
+// read it independently, which is what allows them to select different tokens.
+// Dequantisation, the per-block K scales of the seeded prefix, the online
+// softmax and the partial/merge split are the dense kernel's.
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -16,7 +19,7 @@ namespace {
 
 constexpr int kHeadDim = 128;
 constexpr int kGroup = 4;          // query heads per K/V head
-constexpr int kKvHeads = 8;
+constexpr int kHeads = 32;         // query heads, one id row each
 constexpr int kLanes = 32;
 constexpr int kDims = kHeadDim / kLanes;  // 4 channels per lane
 constexpr int kWarps = 8;
@@ -37,7 +40,8 @@ __global__ void sparse_split_kernel(
     const int32_t* __restrict__ idx, float* __restrict__ po,
     float* __restrict__ ps, int n, int prefix, int block_size, int max_len,
     int n_blocks, int parts, int max_sel) {
-  const int h = blockIdx.y;
+  const int hq = blockIdx.y;          // query head
+  const int hkv = hq / kGroup;        // the K/V head it reads
   const int lane = threadIdx.x & (kLanes - 1);
   const int part = blockIdx.x * kWarps + threadIdx.x / kLanes;
   if (part >= parts) return;
@@ -46,29 +50,21 @@ __global__ void sparse_split_kernel(
   const int t1 = min(t0 + kWarpTokens, n);
   const int d0 = lane * kDims;
   // This head's token list; the read is warp-uniform, i.e. a broadcast.
-  const int32_t* ih = idx + static_cast<size_t>(h) * max_sel;
+  const int32_t* ih = idx + static_cast<size_t>(hq) * max_sel;
 
-  __half qreg[kGroup][kDims];
-  const __half* qh = q + static_cast<size_t>(h * kGroup) * kHeadDim;
+  __half qreg[kDims];
+  const __half* qh = q + static_cast<size_t>(hq) * kHeadDim + d0;
 #pragma unroll
-  for (int j = 0; j < kGroup; ++j) {
-#pragma unroll
-    for (int i = 0; i < kDims; ++i) qreg[j][i] = qh[j * kHeadDim + d0 + i];
-  }
+  for (int i = 0; i < kDims; ++i) qreg[i] = qh[i];
 
-  float m[kGroup], l[kGroup], acc[kGroup][kDims];
+  float m = -1e30f, l = 0.0f, acc[kDims];
 #pragma unroll
-  for (int j = 0; j < kGroup; ++j) {
-    m[j] = -1e30f;
-    l[j] = 0.0f;
-#pragma unroll
-    for (int i = 0; i < kDims; ++i) acc[j][i] = 0.0f;
-  }
+  for (int i = 0; i < kDims; ++i) acc[i] = 0.0f;
 
-  const uint8_t* kh = k + static_cast<size_t>(h) * max_len * kHeadDim;
-  const uint8_t* vh = v + static_cast<size_t>(h) * max_len * kHeadDim;
-  const float* kth = k_tail + static_cast<size_t>(h) * max_len;
-  const float* vsh = v_scale + static_cast<size_t>(h) * max_len;
+  const uint8_t* kh = k + static_cast<size_t>(hkv) * max_len * kHeadDim;
+  const uint8_t* vh = v + static_cast<size_t>(hkv) * max_len * kHeadDim;
+  const float* kth = k_tail + static_cast<size_t>(hkv) * max_len;
+  const float* vsh = v_scale + static_cast<size_t>(hkv) * max_len;
 
   float ks[kDims];
   bool have_ks = false;
@@ -82,7 +78,7 @@ __global__ void sparse_split_kernel(
       const int blk = t / block_size;
       if (!have_ks || blk != last_blk) {
         const float* sb = k_block
-            + (static_cast<size_t>(h) * n_blocks + blk) * kHeadDim + d0;
+            + (static_cast<size_t>(hkv) * n_blocks + blk) * kHeadDim + d0;
 #pragma unroll
         for (int j = 0; j < kDims; ++j) ks[j] = sb[j];
         have_ks = true;
@@ -100,57 +96,34 @@ __global__ void sparse_split_kernel(
     const uint32_t vw = *reinterpret_cast<const uint32_t*>(
         vh + static_cast<size_t>(t) * kHeadDim + d0);
 
-    float kf[kDims];
-    float sc[kGroup];
+    float sc = 0.0f;
 #pragma unroll
-    for (int i = 0; i < kDims; ++i) kf[i] = deq(kw, i, ks[i]);
+    for (int i = 0; i < kDims; ++i) sc += __half2float(qreg[i]) * deq(kw, i, ks[i]);
 #pragma unroll
-    for (int j = 0; j < kGroup; ++j) {
-      sc[j] = 0.0f;
-#pragma unroll
-      for (int i = 0; i < kDims; ++i)
-        sc[j] += __half2float(qreg[j][i]) * kf[i];
-    }
-#pragma unroll
-    for (int off = kLanes / 2; off > 0; off >>= 1) {
-#pragma unroll
-      for (int j = 0; j < kGroup; ++j) sc[j] += __shfl_down(sc[j], off, kLanes);
-    }
-#pragma unroll
-    for (int j = 0; j < kGroup; ++j) sc[j] = __shfl(sc[j], 0, kLanes) * kInvSqrtD;
+    for (int off = kLanes / 2; off > 0; off >>= 1) sc += __shfl_down(sc, off, kLanes);
+    sc = __shfl(sc, 0, kLanes) * kInvSqrtD;
 
     const float vs = vsh[t];
-    float vf[kDims];
+    if (sc > m) {
+      const float corr = __expf(m - sc);
+      l *= corr;
 #pragma unroll
-    for (int i = 0; i < kDims; ++i) vf[i] = deq(vw, i, vs);
-
-#pragma unroll
-    for (int j = 0; j < kGroup; ++j) {
-      if (sc[j] > m[j]) {
-        const float corr = __expf(m[j] - sc[j]);
-        l[j] *= corr;
-#pragma unroll
-        for (int i = 0; i < kDims; ++i) acc[j][i] *= corr;
-        m[j] = sc[j];
-      }
-      const float p = __expf(sc[j] - m[j]);
-      l[j] += p;
-#pragma unroll
-      for (int i = 0; i < kDims; ++i) acc[j][i] += p * vf[i];
+      for (int i = 0; i < kDims; ++i) acc[i] *= corr;
+      m = sc;
     }
+    const float p = __expf(sc - m);
+    l += p;
+#pragma unroll
+    for (int i = 0; i < kDims; ++i) acc[i] += p * deq(vw, i, vs);
   }
 
-  const size_t base = (static_cast<size_t>(h * kGroup) * parts) + part;
+  const size_t off = static_cast<size_t>(hq) * parts + part;
+  float* dst = po + off * kHeadDim + d0;
 #pragma unroll
-  for (int j = 0; j < kGroup; ++j) {
-    const size_t off = base + static_cast<size_t>(j) * parts;
-    float* dst = po + off * kHeadDim + d0;
-#pragma unroll
-    for (int i = 0; i < kDims; ++i) dst[i] = acc[j][i];
-    if (lane == 0) {
-      ps[off * 2] = m[j];
-      ps[off * 2 + 1] = l[j];
-    }
+  for (int i = 0; i < kDims; ++i) dst[i] = acc[i];
+  if (lane == 0) {
+    ps[off * 2] = m;
+    ps[off * 2 + 1] = l;
   }
 }
 
@@ -181,7 +154,7 @@ void sparse_attn_split(uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t k_tail,
                        uintptr_t po, uintptr_t ps, int64_t n, int64_t prefix,
                        int64_t block_size, int64_t max_len, int64_t n_blocks,
                        int64_t parts, int64_t max_sel) {
-  dim3 grid(static_cast<unsigned>((parts + kWarps - 1) / kWarps), kKvHeads);
+  dim3 grid(static_cast<unsigned>((parts + kWarps - 1) / kWarps), kHeads);
   sparse_split_kernel<<<grid, kThreads>>>(
       reinterpret_cast<const __half*>(q), reinterpret_cast<const uint8_t*>(k),
       reinterpret_cast<const uint8_t*>(v),
@@ -199,7 +172,7 @@ void sparse_attn_split(uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t k_tail,
 
 void sparse_attn_merge(uintptr_t po, uintptr_t ps, uintptr_t out,
                        int64_t parts) {
-  sparse_merge_kernel<<<kKvHeads * kGroup, kHeadDim>>>(
+  sparse_merge_kernel<<<kHeads, kHeadDim>>>(
       reinterpret_cast<const float*>(po), reinterpret_cast<const float*>(ps),
       reinterpret_cast<__half*>(out), static_cast<int>(parts));
   hipError_t err = hipGetLastError();

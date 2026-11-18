@@ -14,11 +14,12 @@ from ..with_hip.kv_cache import HipKVCache
 class Policy:
     """Decode-time KV selection.
 
-    ``select`` returns int32 token ids ``[num_kv_heads, m]`` on the query's
-    device; ``-1`` marks padding, which the kernel skips.  Any subset of
-    ``[0, n)`` is legal - blocks, top-k tokens and IVF posting lists all fit -
-    but the ids must be unique (a repeat is counted twice by the softmax) and
-    must include the current token, or decode silently loses its input.
+    ``select`` returns int32 token ids ``[num_attention_heads, m]`` on the
+    query's device, one row per query head; ``-1`` marks padding, which the
+    kernel skips.  Any subset of ``[0, n)`` is legal - blocks, top-k tokens and
+    IVF posting lists all fit - but a row's ids must be unique (a repeat is
+    counted twice by the softmax) and must include the current token, or decode
+    silently loses its input.
     """
 
     def prepare(self, kv: HipKVCache) -> None:
@@ -51,7 +52,7 @@ class WindowPolicy(Policy):
                 torch.arange(start, n, device=q.device),
             ]
         ).to(torch.int32)
-        return ids.expand(kv.num_kv_heads, -1).contiguous()
+        return ids.expand(q.shape[1], -1).contiguous()
 
 
 class NaiveIvfPolicy(Policy):
@@ -74,6 +75,11 @@ class NaiveIvfPolicy(Policy):
             k, _ = kv.dequantize(li)
             for hi in range(self.num_kv_heads):
                 self.centroids[li][hi] = kmeans_gpu(k[0, hi], self.nprobe)
+                # TODO: 分簇
 
-    def select(self, q, kv: HipKVCache, layer_idx: int) -> torch.Tensor:
-        raise NotImplementedError
+    def select(self, q: torch.Tensor, kv: HipKVCache, layer_idx: int) -> torch.Tensor:
+        assert q.shape[0] == 1 and q.shape[2] == 1
+        q = q.view(self.num_kv_heads, -1, self.head_dim)
+        centroids = self.centroids[layer_idx]
+
+        # TODO: 选出 topk 个簇
