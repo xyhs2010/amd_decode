@@ -7,6 +7,7 @@ prefill.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import torch
@@ -71,10 +72,11 @@ class NaiveIvfPolicy(Policy):
     no id is ever counted twice - and no token falls out of reach either.
     """
 
-    def __init__(self, nlist: int | None = None, nprobe: int = 16,
+    def __init__(self, nlist: int | None = None, nprobe: int | None = None,
                  window: int = 512,
                  index_file: str | Path | None = None) -> None:
-        # ``nlist=None`` means 32 indexed tokens per cluster
+        # ``nlist=None`` means 32 indexed tokens per cluster; ``nprobe=None``
+        # means ``2 * sqrt(nlist)`` clusters per query head.
         self.nlist = nlist
         self.nprobe = nprobe
         self.window = window
@@ -163,10 +165,12 @@ class NaiveIvfPolicy(Policy):
         if not self.order:
             return tail.unsqueeze(0).expand(rows, -1).contiguous()
 
+        nprobe = self.nprobe or int(2 * math.sqrt(self.nlist))
+        nprobe = min(nprobe, self.nlist)
         group = rows // kv.num_kv_heads
         q = q.view(kv.num_kv_heads, group, kv.head_dim)
         scores = torch.einsum("hgd,hkd->hgk", q, self.centroids[layer_idx])
-        top = scores.topk(self.nprobe, dim=-1).indices      # [H, group, nprobe]
+        top = scores.topk(nprobe, dim=-1).indices           # [H, group, nprobe]
         # unsqueeze + gather keeps the row per K/V head; ``start[:, top]``
         # would broadcast into [H, H, group, nprobe] instead.
         start = self.start[layer_idx].unsqueeze(1).expand(-1, group, -1)
@@ -177,7 +181,7 @@ class NaiveIvfPolicy(Policy):
         keep = off < length.unsqueeze(-1)
         width = keep.shape[-1]
         pos = (st.unsqueeze(-1) + off).clamp_max(order.shape[2] - 1)
-        ids = order.gather(2, pos.reshape(kv.num_kv_heads, group, self.nprobe * width))
-        keep = keep.reshape(kv.num_kv_heads, group, self.nprobe * width)
+        ids = order.gather(2, pos.reshape(kv.num_kv_heads, group, nprobe * width))
+        keep = keep.reshape(kv.num_kv_heads, group, nprobe * width)
         ids = torch.where(keep, ids, -1).reshape(rows, -1)
         return torch.cat([ids, tail.unsqueeze(0).expand(rows, -1)], 1).contiguous()
