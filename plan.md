@@ -2,3 +2,7 @@
 2. 把 kvcache 放在 host 内存，并和原实现对齐
 3. 原实现跑分(跑起来太慢了，得先加速)
 4. 自己写 kernel 来实现
+5. 加速后的原实现跑分
+6. 写一个简单的 sparse attention
+7. spase 跑分
+8. 换 longbench v2 + qwen3.5 9b
