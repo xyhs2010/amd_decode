@@ -1,4 +1,6 @@
+# 5.21+ requires Python >= 3.11; on Python 3.10 (e.g. torch_musa images)
+# pip resolves this to 5.20.2, which already contains qwen3_5.
 torch>=2.6
-transformers>=5.23
+transformers>=5.20.2
 safetensors>=0.8
 tokenizers>=0.23

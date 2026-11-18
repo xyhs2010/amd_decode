@@ -270,7 +270,7 @@ class Qwen35Torch(DecodeModel):
         if kv is not None:
             kv.set_state(layer_idx, recurrent_state)
 
-        out = self._rms_gated(out, p["linear_attn.norm.weight"], z)
+        out = self._rms_gated(out.to(x.dtype), p["linear_attn.norm.weight"], z)
         return self.linear(out.reshape(batch, seq, value_dim),
                            p["linear_attn.out_proj.weight"])
 

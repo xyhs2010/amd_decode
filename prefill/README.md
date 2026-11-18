@@ -1,11 +1,9 @@
 # Qwen3.5-9B prefill
 
-Builds the dense prefill cache used by the decode backend.  This is the one
-place where `transformers` is the right tool: it already implements Gated
-DeltaNet, mRoPE and the hybrid attention; the decode path stays dependency-free.
-
-Run it on a CUDA machine.  A 32 GB card (e.g. 5090) is enough for the bf16
-model with q8 K/V and `--chunk-size 4096`.
+A thin wrapper around the stock `transformers` implementation: one forward with
+`DynamicCache`, then the cache tensors are written to disk.  There is no custom
+attention, no quantization and no verification — the saved cache is exactly
+what transformers computed, and it is checked on the decode side.
 
 ## Environment
 
@@ -15,7 +13,8 @@ uv pip install -r prefill/requirements.txt
 ```
 
 `requirements.txt` pins `transformers>=5.23` (the first release with
-`qwen3_5`).
+`qwen3_5`).  `--device` accepts any torch device string and `--dtype` is
+`bfloat16` or `float16`, so the script makes no assumption about the machine.
 
 ## Data
 
@@ -34,18 +33,20 @@ RULER data is the same tree the existing caches use:
 ## Run
 
 ```bash
-# small smoke test: 2 samples per (length, task)
+# smoke test: 2 samples per (length, task)
 python prefill/prefill_qwen35.py \
     --model data/models/Qwen3.5-9B \
     --benchmark ruler --lengths 16384 \
-    --tasks niah_single_2 cwe --limit 2 \
-    --out data/kv_cache --verify
+    --tasks niah_single_2 cwe --limit 2
 
-# the real sweep: 16K..256K, q8 K/V
+# the full sweep
 python prefill/prefill_qwen35.py \
-    --benchmark ruler --lengths 16384 32768 65536 131072 262144 \
-    --out data/kv_cache --chunk-size 4096
+    --benchmark ruler --lengths 16384 32768 65536 131072 262144
 ```
+
+`--chunk-size N` splits the forward into N-token pieces when the whole prompt
+does not fit in one pass; the default `0` runs it in one forward.  Chunking
+does not change the saved result.
 
 `--limit` is per `(length, task)` for RULER and overall for `jsonl`.
 
@@ -53,26 +54,51 @@ Resumable: a sample is skipped when `meta.json` and all 32 `layer_*.safetensors`
 exist.  Use `--overwrite` to rebuild.
 
 The answer prefix is **not** part of the prefill; the decode side appends it,
-exactly like the existing RULER protocol.
+exactly like the RULER protocol.
 
 ## Output layout
 
 ```
-<out>/<model_tag>/<quant>/<benchmark>/L<length>/<task>/<sample_id>/
+<out>/<model_tag>/<dtype>/<benchmark>/L<length>/<task>/<sample_id>/
     meta.json
     tokens.safetensors
     layer_00.safetensors ... layer_31.safetensors
 ```
 
-`model_tag` defaults to `<model dir name>-bf16`.  Per layer:
+`model_tag` defaults to the model directory name.  Per layer:
 
-- linear attention (24 layers): `conv_state` fp16 `[1, 8192, 4]` and
-  `recurrent_state` fp32 `[1, 32, 128, 128]`
-- full attention (8 layers, q8): `k_q`/`v_q` int8 `[1, 4, T, 256]`,
-  `k_scale` float32 `[1, 4, ceil(T/8192), 1, 256]`, `v_scale` float32
-  `[1, 4, T, 1]`
+- linear attention (24 layers): `conv_state` `[1, 8192, 4]` and
+  `recurrent_state` `[1, 32, 128, 128]` (fp32)
+- full attention (8 layers): `k` and `v` `[1, 4, T, 256]` in the model dtype
 
-q8 at 256K is about 4.3 GB per sample; the DeltaNet state adds ~51 MB.
+`meta.json` records `seq_len`, `layer_types`, the head dimensions, the rope
+parameters and the linear-attention dimensions, so the decode reader does not
+depend on these constants.
+
+## LongBench v2
+
+```bash
+mkdir -p data/raw/longbench_v2
+curl -L -C - -o data/raw/longbench_v2/data.json \
+  https://hf-mirror.com/datasets/THUDM/LongBench-v2/resolve/main/data.json
+
+python prefill/build_longbench_v2.py
+```
+
+This writes `metadata.jsonl` (all 503 samples, with answers and choices) and
+`prompts_256k.jsonl` (the official template, only samples that fit 262144
+tokens): 402 of 503 samples.
+
+Then prefill the fitting subset:
+
+```bash
+python prefill/prefill_qwen35.py \
+    --benchmark jsonl --jsonl data/raw/longbench_v2/prompts_256k.jsonl
+```
+
+The chat-template question (raw official prompt vs the model's chat template)
+is decided with the benchmark adapter, not here; `build_longbench_v2.py` emits
+the raw official template.
 
 ## Other benchmarks
 
@@ -82,15 +108,11 @@ Any JSONL works with `--benchmark jsonl`; one object per line:
 {"sample_id": "...", "task": "single_doc_qa", "length": 0, "prompt": "full prompt text"}
 ```
 
-`prompt` must be the **entire** text to prefill (for LongBench v2: context,
-question, choices and the answer-format instruction).  `length` is only used
-for the directory name.
+`prompt` must be the **entire** text to prefill.  `length` is only used for the
+directory name.
 
-## Memory notes
+## Limits
 
-- The model is bf16 (`~19 GB`); the script does not quantize weights.
 - Prompt tokens above `--max-tokens 262144` are skipped, matching the model's
   native context.
-- If the first sample OOMs, lower `--chunk-size`; the attention mask grows with
-  `past + chunk`, and DeltaNet's chunked kernel allocates per chunk.
-- `--quant fp16` doubles K/V memory and disk; q8 is the intended default.
+- The cache is stored in the model dtype; there is no q8/q4 step here.
