@@ -1,6 +1,23 @@
 import torch
 
 
+def _assign(x: torch.Tensor, centers: torch.Tensor,
+            chunk: int = 16384) -> torch.Tensor:
+    """Nearest center per row of ``x``, chunked over rows.
+
+    ``cdist`` would materialise the whole ``[n, k]`` matrix - 8 GiB at 256K
+    tokens and 32 points per cluster - so the distances are reduced per chunk.
+    """
+    x2 = (x * x).sum(1)
+    c2 = (centers * centers).sum(1)
+    out = []
+    for i in range(0, x.shape[0], chunk):
+        block = x[i:i + chunk]
+        dist = x2[i:i + chunk, None] - 2 * block @ centers.T + c2[None, :]
+        out.append(dist.argmin(1))
+    return torch.cat(out)
+
+
 def _min_sq_dist(x: torch.Tensor, centers: torch.Tensor,
                  chunk: int = 8192) -> torch.Tensor:
     """Squared distance from every row of ``x`` to its nearest center."""
@@ -83,9 +100,7 @@ def kmeans_gpu(
     labels = torch.zeros(n, dtype=torch.long, device=device)
 
     for _ in range(max_iter):
-        # 计算 (N, K) 欧氏距离矩阵
-        dists = torch.cdist(x, centroids, p=2.0)
-        new_labels = torch.argmin(dists, dim=1)
+        new_labels = _assign(x, centroids)
 
         new_centroids = torch.zeros_like(centroids)
         counts = torch.bincount(new_labels, minlength=n_clusters).to(x.dtype)

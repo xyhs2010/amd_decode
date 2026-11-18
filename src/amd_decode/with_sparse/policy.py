@@ -7,7 +7,10 @@ prefill.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
+
 from ..with_hip.kv_cache import HipKVCache
 
 
@@ -68,18 +71,60 @@ class NaiveIvfPolicy(Policy):
     no id is ever counted twice - and no token falls out of reach either.
     """
 
-    def __init__(self, nlist: int, nprobe: int, window: int = 512) -> None:
+    def __init__(self, nlist: int | None = None, nprobe: int = 16,
+                 window: int = 512,
+                 index_file: str | Path | None = None) -> None:
+        # ``nlist=None`` means 32 indexed tokens per cluster
         self.nlist = nlist
         self.nprobe = nprobe
         self.window = window
+        self.index_file = None if index_file is None else Path(index_file)
         self.centroids = []   # [L] -> [H, nlist, D]
         self.order = []       # [L] -> [H, n_index]: token ids grouped by cluster
         self.start = []       # [L] -> [H, nlist + 1]: cluster offsets
         self.index_len = 0    # tokens [0, index_len) are in the index
 
+    def save(self) -> None:
+        self.index_file.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "nlist": self.nlist, "window": self.window,
+            "index_len": self.index_len,
+            "centroids": self.centroids, "order": self.order, "start": self.start,
+        }, self.index_file)
+
+    def load(self) -> None:
+        data = torch.load(self.index_file)
+        if self.nlist is not None and self.nlist != data["nlist"]:
+            raise ValueError(
+                f"{self.index_file} holds nlist={data['nlist']}, "
+                f"policy wants nlist={self.nlist}"
+            )
+        if self.window != data["window"]:
+            raise ValueError(
+                f"{self.index_file} holds window={data['window']}, "
+                f"policy wants window={self.window}"
+            )
+        self.nlist = data["nlist"]
+        self.centroids = data["centroids"]
+        self.order = data["order"]
+        self.start = data["start"]
+        self.index_len = data["index_len"]
+
     def prepare(self, kv: HipKVCache) -> None:
         from .kmeans import kmeans_gpu
-        
+
+        index_len = max(0, kv.view(0).n - self.window)
+        if self.index_file is not None and self.index_file.exists():
+            self.load()
+            if self.index_len != index_len:
+                raise ValueError(
+                    f"{self.index_file} was built for index_len {self.index_len}, "
+                    f"this cache gives {index_len}"
+                )
+            return
+
+        if self.nlist is None:
+            self.nlist = max(1, index_len // 32)
         self.centroids = [
             torch.empty(kv.num_kv_heads, self.nlist, kv.head_dim,
                         dtype=torch.float16, device="cuda")
@@ -106,6 +151,8 @@ class NaiveIvfPolicy(Policy):
                 ).to(torch.int32))
             self.order.append(torch.stack(order))
             self.start.append(torch.stack(start))
+        if self.index_file is not None:
+            self.save()
 
     def select(self, q: torch.Tensor, kv: HipKVCache, layer_idx: int) -> torch.Tensor:
         assert q.shape[0] == 1 and q.shape[2] == 1

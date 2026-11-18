@@ -43,6 +43,7 @@ from amd_decode.bench import (
 from amd_decode.utils.prefill_cache import SavedKVCache
 from amd_decode.with_host import HostQwen3
 from amd_decode.with_hip import HipQwen3
+from amd_decode.with_sparse import NaiveIvfPolicy, SparseQwen3
 from amd_decode.with_torch import Qwen3Torch
 
 
@@ -89,7 +90,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--model-dir", default="data/models/Qwen3-8B-Base")
     parser.add_argument("--kv-root", default="data/kv_cache")
     parser.add_argument("--ruler-root", default="data/raw/ruler")
-    parser.add_argument("--impl", default="device", help="Impl decoder")
+    parser.add_argument("--impl", default="device",
+                        help="Impl decoder: device, host, hip or sparse")
+    parser.add_argument("--index-dir", default="data/ivf",
+                        help="sparse only: IVF indices written by "
+                             "scripts/build_ivf_index.py")
     parser.add_argument(
         "--lengths",
         type=_parse_lengths,
@@ -206,6 +211,11 @@ def main(argv: list[str] | None = None) -> None:
                 args.model_dir, device="cuda", dtype=torch.float16,
                 weight_bits=4,
             )
+        elif args.impl == "sparse":
+            decoder = SparseQwen3(
+                args.model_dir, device="cuda", dtype=torch.float16,
+                weight_bits=4,
+            )
         else:
             raise ValueError(f"unknown impl {args.impl!r}")
 
@@ -237,6 +247,12 @@ def main(argv: list[str] | None = None) -> None:
             )
             kv = decoder.make_kv_cache(saved.seq_len + prefix_len + budget + 1)
             kv.seed_from_prefill(saved)
+            if args.impl == "sparse":
+                # One index per sample: loaded if already built, else built
+                # here.  nlist/nprobe/window are the policy's defaults.
+                decoder.policy = NaiveIvfPolicy(
+                    index_file=Path(args.index_dir) / f"{sample.sample_id}.pt",
+                )
             previous_kv = kv
             decoder.set_kv_cache(kv)
 
