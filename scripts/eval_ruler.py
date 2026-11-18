@@ -42,12 +42,8 @@ from amd_decode.bench import (
 )
 from amd_decode.utils.prefill_cache import SavedKVCache
 from amd_decode.with_host import HostQwen3
+from amd_decode.with_hip import HipQwen3
 from amd_decode.with_torch import Qwen3Torch
-
-# The seeded cache is resident for the whole sample. 256K needs ~18.6 GiB
-# (VRAM for the torch backend, host RAM for the host backend); we do not
-# support that length here.
-MAX_KV_LEN = 131072
 
 
 def _parse_lengths(value: str) -> list[int] | None:
@@ -205,19 +201,31 @@ def main(argv: list[str] | None = None) -> None:
                 args.model_dir, device="cuda", dtype=torch.float16,
                 weight_bits=4,
             )
+        elif args.impl == "hip":
+            decoder = HipQwen3(
+                args.model_dir, device="cuda", dtype=torch.float16,
+                weight_bits=4,
+            )
         else:
-            raise Exception(f"No impl f{args.impl}")
+            raise ValueError(f"unknown impl {args.impl!r}")
 
         previous_kv = None
 
         def prepare(sample) -> None:
             """Seed a fresh q8 cache for this sample and attach it."""
             nonlocal previous_kv
+            # Release the previous sample's cache first: at 256K each one is
+            # ~18.5 GiB of pinned host memory, so two at once run out.
+            old, previous_kv = previous_kv, None
+            if old is not None:
+                decoder.set_kv_cache(None)
+                torch.cuda.synchronize()
+                old.free()
             saved = SavedKVCache(sample.cache_path)
-            if saved.seq_len > MAX_KV_LEN:
+            if args.impl == "device" and saved.seq_len > 131072 :
                 raise SystemExit(
                     f"{sample.sample_id}: seq_len {saved.seq_len} exceeds "
-                    f"{MAX_KV_LEN}; 256K contexts are not supported"
+                    f"gpu limit;"
                 )
             prefix_len = len(
                 tokenizer.encode(sample.answer_prefix, add_special_tokens=False)
@@ -229,10 +237,8 @@ def main(argv: list[str] | None = None) -> None:
             )
             kv = decoder.make_kv_cache(saved.seq_len + prefix_len + budget + 1)
             kv.seed_from_prefill(saved)
-            old, previous_kv = previous_kv, kv
+            previous_kv = kv
             decoder.set_kv_cache(kv)
-            if old is not None:
-                old.free()
 
         config = EvalConfig(
             max_new_tokens=args.max_new_tokens,

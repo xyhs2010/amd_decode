@@ -132,12 +132,13 @@ class EvalReport:
         return {key: _mean(scores) for key, scores in sorted(groups.items())}
 
     def overall_score(self) -> float:
-        """Mean of the (task, length) cell scores.
+        """Mean of the (task, length) cell scores, already in percent.
 
         With a single context length this is RULER's usual average over tasks;
         with several lengths every cell is weighted equally.
         """
-        return _mean(self.task_length_scores().values())
+        cells = list(self.task_length_scores().values())
+        return statistics.fmean(cells) if cells else float("nan")
 
     def summary(self) -> str:
         if not self.results:
