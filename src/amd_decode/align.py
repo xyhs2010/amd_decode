@@ -8,7 +8,7 @@ A backend is any object implementing :class:`DecodeModel` - four operations:
 * ``forward(input_ids, position_offset=None)``: run one pass, return logits;
 * ``get_features()``: features captured during the most recent ``forward``.
 
-The protocol is defined in ``amd_decode``.  ``Qwen3Torch`` implements it
+The protocol is defined in ``amd_decode``.  ``Qwen35Torch`` implements it
 directly.  A future kernel backend only has to provide the same four methods;
 ``align`` does not know anything else about it.
 
@@ -40,7 +40,7 @@ import torch
 from . import DecodeModel
 
 # Per-tensor relative L2 error: ||ref - alt|| / ||ref||.  A per-element
-# tolerance is useless here: Qwen3 residual streams mix channels of ~1e4 with
+# tolerance is useless here: Qwen3.5 residual streams mix channels of ~1e4 with
 # near-zero ones.  3e-2 covers the drift of the int4 FFN kernel, whose dequant
 # is closer to the quantized weights than the reference's extra bf16 rounding;
 # logits stay within ~5e-3 and greedy argmax matches.

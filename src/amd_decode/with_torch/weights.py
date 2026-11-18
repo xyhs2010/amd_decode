@@ -1,8 +1,9 @@
-"""Sharded Qwen3 weight access.
+"""Sharded Qwen3.5 weight access.
 
-Weights stay in shard files and are read on demand, so the full 16 GB model is
-never duplicated in RAM. ``Qwen3Torch`` (see ``model.py``) streams one layer at
-a time to the GPU.
+The checkpoint is the multimodal ``Qwen3_5ForConditionalGeneration``; only the
+``model.language_model`` tensors are read.  Vision and MTP tensors stay on disk
+forever.  Weights are memory-mapped and read on demand, so the full checkpoint
+is never materialized in RAM.
 """
 
 from __future__ import annotations
@@ -14,22 +15,41 @@ import torch
 
 from ..utils.safetensor_io import SafeTensorsFile
 
-LAYER_TENSORS = (
+EMBED = "model.language_model.embed_tokens.weight"
+FINAL_NORM = "model.language_model.norm.weight"
+LM_HEAD = "lm_head.weight"
+
+_COMMON = (
     "input_layernorm.weight",
     "post_attention_layernorm.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+)
+
+_FULL_ATTENTION = (
     "self_attn.q_proj.weight",
     "self_attn.k_proj.weight",
     "self_attn.v_proj.weight",
     "self_attn.o_proj.weight",
     "self_attn.q_norm.weight",
     "self_attn.k_norm.weight",
-    "mlp.gate_proj.weight",
-    "mlp.up_proj.weight",
-    "mlp.down_proj.weight",
+)
+
+_LINEAR_ATTENTION = (
+    "linear_attn.in_proj_qkv.weight",
+    "linear_attn.in_proj_z.weight",
+    "linear_attn.in_proj_a.weight",
+    "linear_attn.in_proj_b.weight",
+    "linear_attn.conv1d.weight",
+    "linear_attn.A_log",
+    "linear_attn.dt_bias",
+    "linear_attn.norm.weight",
+    "linear_attn.out_proj.weight",
 )
 
 
-class Qwen3Weights:
+class Qwen35Weights:
     def __init__(self, model_dir: str | Path) -> None:
         self.model_dir = Path(model_dir)
         index = json.loads((self.model_dir / "model.safetensors.index.json").read_text())
@@ -44,6 +64,8 @@ class Qwen3Weights:
             raise KeyError(f"tensor {name!r} not in index") from exc
         return self._files[shard].get(name, dtype=dtype)
 
-    def layer(self, layer_idx: int, dtype: torch.dtype | None = None) -> dict[str, torch.Tensor]:
-        prefix = f"model.layers.{layer_idx}."
-        return {name: self.get(prefix + name, dtype=dtype) for name in LAYER_TENSORS}
+    def layer(self, layer_idx: int, full_attention: bool, dtype: torch.dtype | None = None
+              ) -> dict[str, torch.Tensor]:
+        prefix = f"model.language_model.layers.{layer_idx}."
+        names = _COMMON + (_FULL_ATTENTION if full_attention else _LINEAR_ATTENTION)
+        return {name: self.get(prefix + name, dtype=dtype) for name in names}

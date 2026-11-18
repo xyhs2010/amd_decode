@@ -1,7 +1,7 @@
-"""Torch implementation of Qwen3 decode, used as the flexible reference backend."""
+"""PyTorch reference implementation of Qwen3.5-9B decode (W4A16)."""
 
-from .config import Qwen3Config
+from .config import Qwen35Config
 from .kv_cache import KVCache
-from .model import Qwen3Torch
+from .model import Qwen35Torch
 
-__all__ = ["Qwen3Config", "Qwen3Torch", "KVCache"]
+__all__ = ["KVCache", "Qwen35Config", "Qwen35Torch"]

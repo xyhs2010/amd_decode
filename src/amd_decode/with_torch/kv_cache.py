@@ -1,4 +1,4 @@
-"""The int8 KV cache used by ``Qwen3Torch``.
+"""The int8 KV cache used by ``Qwen35Torch``.
 
 K/V are stored as int8 plus scales and dequantised to fp16 before attention,
 so ``_layer`` is unchanged.  This implementation keeps the buffers in VRAM;

@@ -1,6 +1,5 @@
-"""Qwen3 decode with the int8 KV cache in host memory."""
+"""Qwen3.5 decode with the K/V cache in host memory."""
 
-from .kv_cache import HostKVCache
-from .model import HostQwen3
+from .model import HostQwen35
 
-__all__ = ["HostKVCache", "HostQwen3"]
+__all__ = ["HostQwen35"]

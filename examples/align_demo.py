@@ -1,17 +1,13 @@
-"""Alignment demo: Qwen3Torch against itself and against a ``_layer`` override.
+"""Alignment demo: Qwen35Torch against itself and a ``_layer`` override.
 
 Run from the repo root:
 
     PYTHONPATH=src .venv/bin/python examples/align_demo.py
-    PYTHONPATH=src .venv/bin/python examples/align_demo.py --weight-bits 4 --decode
 
-The second case is the one to copy when writing a real custom layer: subclass
-``Qwen3Torch``, keep the ``_layer`` signature, and let ``align`` prove the new
-maths is byte-identical to the reference before wiring it into the hot path.
-
-``align`` takes two backend objects and one cache per object.  A backend is
-any object with ``set_kv_cache`` / ``set_hook`` / ``forward`` / ``get_features``
-(see ``amd_decode.align.DecodeModel``).
+The second case is the template for a custom layer: subclass ``Qwen35Torch``,
+keep the ``_layer`` signature, and let ``align`` prove the new maths matches the
+reference before wiring it into the hot path.  Decode/cache comparisons return
+once the Qwen3.5 cache lands.
 """
 
 from __future__ import annotations
@@ -21,73 +17,50 @@ import argparse
 import torch
 
 from amd_decode.align import align
-from amd_decode.with_torch import Qwen3Torch
+from amd_decode.with_torch import Qwen35Torch
 
 
-class SameQwen3(Qwen3Torch):
-    """A custom ``_layer`` that is copied verbatim from the base class.
-
-    Replace the body with the new implementation; as long as it computes the
-    same thing, ``align`` should report byte-identical outputs.
-    """
+class SameQwen35(Qwen35Torch):
+    """A custom ``_layer`` copied verbatim from the base class."""
 
     def _layer(self, x, p, cos, sin, kv, layer_idx, past):
         h = x
-        q, k, v = self._attn_prep(
-            self._rms(x, p["input_layernorm.weight"]), p, cos, sin
-        )
-        if kv is None:
-            k_all, v_all = k, v
+        n = self._rms(x, p["input_layernorm.weight"])
+        if self.cfg.is_full_attention[layer_idx]:
+            mixer = self._full_attn(n, p, cos, sin, kv, layer_idx, past)
         else:
-            k_all, v_all = kv.append(layer_idx, k, v)
-        x = h + self._attn_out(q, k_all, v_all, p, past)
+            mixer = self._delta_net(n, p, kv, layer_idx)
+        x = h + mixer
 
         h = x
         x = h + self._mlp(self._rms(x, p["post_attention_layernorm.weight"]), p)
         return x
 
 
-def run(model_dir, reference_cls, candidate_cls, tokens, *, device, dtype,
-        weight_bits, decode) -> bool:
-    reference = reference_cls(
-        model_dir, device=device, dtype=dtype, weight_bits=weight_bits
-    )
-    candidate = candidate_cls(
-        model_dir, device=device, dtype=dtype, weight_bits=weight_bits
-    )
-    kv = (
-        reference.make_kv_cache(len(tokens)),
-        candidate.make_kv_cache(len(tokens)),
-    )
-    return align(reference, candidate, kv, tokens, decode=decode)
+def run(model_dir, reference_cls, candidate_cls, tokens, *, device, dtype) -> bool:
+    reference = reference_cls(model_dir, device=device, dtype=dtype)
+    candidate = candidate_cls(model_dir, device=device, dtype=dtype)
+    return align(reference, candidate, None, tokens)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", default="data/models/Qwen3-8B-Base")
+    parser.add_argument("--model-dir", default="data/models/Qwen3.5-9B")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--weight-bits", type=int, default=16, choices=(4, 16))
-    parser.add_argument("--decode", action="store_true",
-                        help="feed one token at a time through the KV cache")
     parser.add_argument("--tokens", type=int, nargs="+",
                         default=[9707, 11, 1879, 13])
     args = parser.parse_args()
 
-    settings = dict(
-        device=args.device,
-        dtype=torch.float16,
-        weight_bits=args.weight_bits,
-        decode=args.decode,
-    )
-
-    print("== Qwen3Torch vs Qwen3Torch (sanity check) ==")
+    print("== Qwen35Torch vs Qwen35Torch (sanity check) ==")
     ok_self = run(
-        args.model_dir, Qwen3Torch, Qwen3Torch, args.tokens, **settings
+        args.model_dir, Qwen35Torch, Qwen35Torch, args.tokens,
+        device=args.device, dtype=torch.float16,
     )
 
-    print("\n== Qwen3Torch vs SameQwen3 (overridden _layer) ==")
+    print("\n== Qwen35Torch vs SameQwen35 (overridden _layer) ==")
     ok_layer = run(
-        args.model_dir, Qwen3Torch, SameQwen3, args.tokens, **settings
+        args.model_dir, Qwen35Torch, SameQwen35, args.tokens,
+        device=args.device, dtype=torch.float16,
     )
 
     if not (ok_self and ok_layer):
