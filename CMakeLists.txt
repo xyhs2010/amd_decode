@@ -13,3 +13,8 @@ pybind11_add_module(_ops MODULE
   src/amd_decode/with_hip/hip/attn.hip
   src/amd_decode/with_hip/hip/bindings.hip)
 install(TARGETS _ops LIBRARY DESTINATION amd_decode/with_hip)
+
+pybind11_add_module(_sparse_ops MODULE
+  src/amd_decode/with_sparse/hip/attn_sparse.hip
+  src/amd_decode/with_sparse/hip/bindings_sparse.hip)
+install(TARGETS _sparse_ops LIBRARY DESTINATION amd_decode/with_sparse)
