@@ -1,13 +1,10 @@
-// Fused int8 KV decode attention for Qwen3-8B (32 query / 8 KV heads, D=128).
-//
-// The seeded prefix uses per-(head, block, channel) K scales; appended tokens
-// use per-token K and V scales.  Every value is dequantised to fp16 before the
-// MAC, matching KVCache.dequantize.
+// Fused fp16 decode attention for Qwen3.5-9B (16 query / 4 KV heads, D=256).
 //
 // One warp owns a contiguous range of tokens and keeps an online-softmax state
 // for the 4 query heads that share its K/V head.  Warps write their partials
 // independently and a second kernel merges them, so there is no split-K
-// interaction between blocks.
+// interaction between blocks.  K/V are read straight from the fp16 cache as
+// [4][max_len][256] rows; nothing is dequantised or expanded.
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -17,28 +14,21 @@
 
 namespace {
 
-constexpr int kHeadDim = 128;
+constexpr int kHeadDim = 256;
 constexpr int kGroup = 4;          // query heads per K/V head
-constexpr int kKvHeads = 8;
+constexpr int kKvHeads = 4;
 constexpr int kLanes = 32;
-constexpr int kDims = kHeadDim / kLanes;  // 4 channels per lane
+constexpr int kDims = kHeadDim / kLanes;  // 8 channels per lane
 constexpr int kWarps = 8;
 constexpr int kThreads = kWarps * kLanes;
-constexpr int kWarpTokens = 256;   // also the partial stride in the workspace
-constexpr float kInvSqrtD = 0.08838834764831845f;  // 1 / sqrt(128)
-
-// One byte of K/V times its per-channel scale, rounded to fp16.
-__device__ __forceinline__ float deq(uint32_t word, int i, float scale) {
-  const int8_t q = static_cast<int8_t>((word >> (8 * i)) & 0xFF);
-  return __half2float(__float2half(static_cast<float>(q) * scale));
-}
+constexpr int kWarpTokens = 512;   // also the partial stride in the workspace
+constexpr float kInvSqrtD = 0.0625f;  // 1 / sqrt(256)
 
 __global__ void attn_split_kernel(
-    const __half* __restrict__ q, const uint8_t* __restrict__ k,
-    const uint8_t* __restrict__ v, const float* __restrict__ k_tail,
-    const float* __restrict__ v_scale, const float* __restrict__ k_block,
-    float* __restrict__ po, float* __restrict__ ps, int n, int prefix,
-    int block_size, int max_len, int n_blocks, int parts) {
+    const __half* __restrict__ q, const __half* __restrict__ k,
+    const __half* __restrict__ v, float* __restrict__ po,
+    float* __restrict__ ps, int n, int64_t k_head_stride, int64_t k_row_stride,
+    int64_t v_head_stride, int64_t v_row_stride, int parts) {
   const int h = blockIdx.y;
   const int lane = threadIdx.x & (kLanes - 1);
   const int part = blockIdx.x * kWarps + threadIdx.x / kLanes;
@@ -65,38 +55,30 @@ __global__ void attn_split_kernel(
     for (int i = 0; i < kDims; ++i) acc[j][i] = 0.0f;
   }
 
-  const uint8_t* kh = k + static_cast<size_t>(h) * max_len * kHeadDim;
-  const uint8_t* vh = v + static_cast<size_t>(h) * max_len * kHeadDim;
-  const float* kth = k_tail + static_cast<size_t>(h) * max_len;
-  const float* vsh = v_scale + static_cast<size_t>(h) * max_len;
+  const __half* kh = k + static_cast<size_t>(h) * k_head_stride;
+  const __half* vh = v + static_cast<size_t>(h) * v_head_stride;
 
-  float ks[kDims];
-  bool have_ks = false;
   for (int t = t0; t < t1; ++t) {
-    if (t < prefix) {
-      if (!have_ks || (t % block_size) == 0) {
-        const float* sb = k_block
-            + (static_cast<size_t>(h) * n_blocks + t / block_size) * kHeadDim + d0;
-#pragma unroll
-        for (int i = 0; i < kDims; ++i) ks[i] = sb[i];
-        have_ks = true;
-      }
-    } else {
-      have_ks = false;
-      const float s = kth[t];
-#pragma unroll
-      for (int i = 0; i < kDims; ++i) ks[i] = s;
-    }
+    // 8 halves = one 16-byte load per lane.
+    const __half* krow = kh + static_cast<size_t>(t) * k_row_stride + d0;
+    const __half* vrow = vh + static_cast<size_t>(t) * v_row_stride + d0;
+    const __half2 k01 = *reinterpret_cast<const __half2*>(krow + 0);
+    const __half2 k23 = *reinterpret_cast<const __half2*>(krow + 2);
+    const __half2 k45 = *reinterpret_cast<const __half2*>(krow + 4);
+    const __half2 k67 = *reinterpret_cast<const __half2*>(krow + 6);
+    const __half2 v01 = *reinterpret_cast<const __half2*>(vrow + 0);
+    const __half2 v23 = *reinterpret_cast<const __half2*>(vrow + 2);
+    const __half2 v45 = *reinterpret_cast<const __half2*>(vrow + 4);
+    const __half2 v67 = *reinterpret_cast<const __half2*>(vrow + 6);
 
-    const uint32_t kw = *reinterpret_cast<const uint32_t*>(
-        kh + static_cast<size_t>(t) * kHeadDim + d0);
-    const uint32_t vw = *reinterpret_cast<const uint32_t*>(
-        vh + static_cast<size_t>(t) * kHeadDim + d0);
+    const float kf[kDims] = {
+        __low2float(k01), __high2float(k01), __low2float(k23), __high2float(k23),
+        __low2float(k45), __high2float(k45), __low2float(k67), __high2float(k67)};
+    const float vf[kDims] = {
+        __low2float(v01), __high2float(v01), __low2float(v23), __high2float(v23),
+        __low2float(v45), __high2float(v45), __low2float(v67), __high2float(v67)};
 
-    float kf[kDims];
     float sc[kGroup];
-#pragma unroll
-    for (int i = 0; i < kDims; ++i) kf[i] = deq(kw, i, ks[i]);
 #pragma unroll
     for (int j = 0; j < kGroup; ++j) {
       sc[j] = 0.0f;
@@ -111,11 +93,6 @@ __global__ void attn_split_kernel(
     }
 #pragma unroll
     for (int j = 0; j < kGroup; ++j) sc[j] = __shfl(sc[j], 0, kLanes) * kInvSqrtD;
-
-    const float vs = vsh[t];
-    float vf[kDims];
-#pragma unroll
-    for (int i = 0; i < kDims; ++i) vf[i] = deq(vw, i, vs);
 
 #pragma unroll
     for (int j = 0; j < kGroup; ++j) {
@@ -169,21 +146,16 @@ __global__ void attn_merge_kernel(const float* __restrict__ po,
 
 }  // namespace
 
-void attn_split(uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t k_tail,
-                uintptr_t v_scale, uintptr_t k_block, uintptr_t po,
-                uintptr_t ps, int64_t n, int64_t prefix, int64_t block_size,
-                int64_t max_len, int64_t n_blocks, int64_t parts) {
+void attn_split(uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t po,
+                uintptr_t ps, int64_t n, int64_t k_head_stride,
+                int64_t k_row_stride, int64_t v_head_stride,
+                int64_t v_row_stride, int64_t parts) {
   dim3 grid(static_cast<unsigned>((parts + kWarps - 1) / kWarps), kKvHeads);
   attn_split_kernel<<<grid, kThreads>>>(
-      reinterpret_cast<const __half*>(q), reinterpret_cast<const uint8_t*>(k),
-      reinterpret_cast<const uint8_t*>(v),
-      reinterpret_cast<const float*>(k_tail),
-      reinterpret_cast<const float*>(v_scale),
-      reinterpret_cast<const float*>(k_block), reinterpret_cast<float*>(po),
-      reinterpret_cast<float*>(ps), static_cast<int>(n),
-      static_cast<int>(prefix), static_cast<int>(block_size),
-      static_cast<int>(max_len), static_cast<int>(n_blocks),
-      static_cast<int>(parts));
+      reinterpret_cast<const __half*>(q), reinterpret_cast<const __half*>(k),
+      reinterpret_cast<const __half*>(v), reinterpret_cast<float*>(po),
+      reinterpret_cast<float*>(ps), static_cast<int>(n), k_head_stride,
+      k_row_stride, v_head_stride, v_row_stride, static_cast<int>(parts));
   hipError_t err = hipGetLastError();
   if (err != hipSuccess) throw std::runtime_error(hipGetErrorString(err));
 }
