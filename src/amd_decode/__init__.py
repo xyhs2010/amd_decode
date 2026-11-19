@@ -18,8 +18,8 @@ LayerHook = Callable[[int, torch.Tensor], Any]
 class DecodeModel(Protocol):
     """Minimal interface for a decode backend."""
 
-    def set_kv_cache(self, kv: Any) -> None:
-        """Attach the cache that ``forward`` should use (or ``None``)."""
+    def load_prefill(self, saved: Any = None, max_len: int | None = None) -> None:
+        """Build the cache and seed it from an offline prefill; ``None`` clears it."""
 
     def set_hook(self, hook: LayerHook | None) -> None:
         """Install ``hook(layer_idx, output)``; its return value is the feature."""
@@ -27,8 +27,8 @@ class DecodeModel(Protocol):
     def forward(self, input_ids, position_offset: int | None = None) -> torch.Tensor:
         """Run one pass.
 
-        ``position_offset=None`` means "start at the attached cache's current
-        ``length``", or 0 when no cache is attached.
+        ``position_offset=None`` means "start at the length of the cache loaded
+        by :meth:`load_prefill`", or 0 when no cache is loaded.
         """
 
     def get_features(self) -> dict[int, Any]:

@@ -40,7 +40,7 @@ def evaluate(
     """Greedy-decode and score every sample.
 
     ``prepare(sample)`` is called before each sample and is where the caller
-    attaches that sample's cache (``decoder.set_kv_cache(...)``).  ``on_result``
+    loads that sample's cache (``decoder.load_prefill(...)``).  ``on_result``
     is called after each sample, which lets a script append results to disk and
     resume a long run.
     """

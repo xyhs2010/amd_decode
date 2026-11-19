@@ -10,8 +10,8 @@ This package is about *quality*, not speed:
 * :mod:`amd_decode.bench.metrics` — official RULER string-match metrics.
 
 The runner is benchmark-agnostic and cache-agnostic.  A backend only implements
-:class:`amd_decode.DecodeModel`; the caller attaches each sample's cache with
-``set_kv_cache`` in the ``prepare`` hook.
+:class:`amd_decode.DecodeModel`; the caller loads each sample's cache with
+``load_prefill`` in the ``prepare`` hook.
 """
 
 from .. import DecodeModel

@@ -2,7 +2,8 @@
 
 A backend is any object implementing :class:`DecodeModel` - four operations:
 
-* ``set_kv_cache(kv)``: attach the cache ``forward`` should use;
+* ``load_prefill(saved)``: build the cache and seed it from an offline prefill
+  (``None`` clears it);
 * ``set_hook(hook)``: call ``hook(layer_idx, output)`` after every layer; the
   hook's return value is the captured *feature* for that layer;
 * ``forward(input_ids, position_offset=None)``: run one pass, return logits;
@@ -12,19 +13,12 @@ The protocol is defined in ``amd_decode``.  ``Qwen35Torch`` implements it
 directly.  A future kernel backend only has to provide the same four methods;
 ``align`` does not know anything else about it.
 
-``align(reference, candidate, kv, tokens)`` runs both objects over the same
-tokens and compares every layer feature and the logits within a fixed relative
-tolerance (``RTOL`` below).
-
-``kv`` supplies one cache per model:
-
-* a pair ``(reference_kv, candidate_kv)``, or
-* a callable ``kv_factory(model)`` returning that model's cache.
-
-Caches may be empty (decode starts at position 0) or seeded; each model starts
-at its own cache's current ``length``.  The two caches must hold the same
-values, but their *storage* may differ - e.g. int8 in host memory vs int8 in
-VRAM - which is how ``examples/host_kv_decode.py`` compares the two backends.
+``align(reference, candidate, prefill, tokens)`` loads the same offline prefill
+into both objects and runs the same tokens, comparing every layer feature and
+the logits within a fixed relative tolerance (``RTOL`` below).  Each backend
+builds its own cache from the same saved directory, so *storage* may differ -
+fp16 in VRAM vs fp16 in pinned host memory - while the values are identical.
+``prefill=None`` runs the cache-less branch: one plain prefill pass, no cache.
 
 Simplifications, on purpose: features are copied to CPU, so keep ``tokens``
 short; the tolerance is fixed here rather than configured.
@@ -74,24 +68,10 @@ def _chunks(tokens, decode: bool) -> list[list[int]]:
     return [[tok] for tok in ids] if decode else [ids]
 
 
-def _caches(kv, reference, candidate):
-    """Resolve the per-model caches from a pair or a factory."""
-    if kv is None:
-        return None, None
-    if callable(kv):
-        return kv(reference), kv(candidate)
-    if isinstance(kv, (tuple, list)) and len(kv) == 2:
-        return kv[0], kv[1]
-    raise TypeError(
-        "kv must be None, a (reference_kv, candidate_kv) pair, "
-        "or a callable kv_factory(model)"
-    )
-
-
-def _run(model, kv, chunks: list[list[int]]) -> list[_Step]:
+def _run(model, prefill, chunks: list[list[int]]) -> list[_Step]:
     """Run the chunks, capturing every layer feature and the logits on CPU."""
-    position = 0 if kv is None else kv.length
-    model.set_kv_cache(kv)
+    position = 0 if prefill is None else prefill.seq_len
+    model.load_prefill(prefill, position + sum(len(c) for c in chunks))
     model.set_hook(lambda _, out: out.detach().to("cpu"))
     steps: list[_Step] = []
     try:
@@ -104,14 +84,14 @@ def _run(model, kv, chunks: list[list[int]]) -> list[_Step]:
             position += len(chunk)
     finally:
         model.set_hook(None)
-        model.set_kv_cache(None)
+        model.load_prefill(None)
     return steps
 
 
 def align(
     reference: DecodeModel,
     candidate: DecodeModel,
-    kv,
+    prefill,
     tokens,
     *,
     decode: bool = False,
@@ -122,9 +102,8 @@ def align(
     Args:
         reference: the known-good backend object.
         candidate: the backend under test.
-        kv: ``(reference_kv, candidate_kv)`` or a callable ``kv_factory(model)``;
-            ``None`` runs the cache-less branch.  Seeded caches start at their
-            current ``length``.
+        prefill: an offline prefill (``SavedKVCache``) both backends load, or
+            ``None`` for the cache-less branch.
         tokens: 1-D token ids (list or tensor).
         decode: feed one token at a time through the cache instead of one
             prefill pass.
@@ -133,18 +112,12 @@ def align(
     Returns:
         True iff every compared feature and logit is within tolerance.
     """
-    ref_kv, alt_kv = _caches(kv, reference, candidate)
-    if decode and (ref_kv is None or alt_kv is None):
-        raise ValueError("decode=True requires a cache per model")
-    if ref_kv is not None and alt_kv is not None:
-        if ref_kv.length != alt_kv.length:
-            raise ValueError(
-                f"cache lengths differ: {ref_kv.length} != {alt_kv.length}"
-            )
+    if decode and prefill is None:
+        raise ValueError("decode=True requires a prefill")
 
     chunks = _chunks(tokens, decode)
-    ref_steps = _run(reference, ref_kv, chunks)
-    alt_steps = _run(candidate, alt_kv, chunks)
+    ref_steps = _run(reference, prefill, chunks)
+    alt_steps = _run(candidate, prefill, chunks)
 
     if verbose:
         print(f"align: decode={decode} "

@@ -2,8 +2,8 @@
 
 The evaluator only needs :class:`amd_decode.DecodeModel`::
 
-    decoder.set_kv_cache(kv)          # done by the caller, per sample
-    decoder.forward(input_ids)        # starts at kv.length
+    decoder.load_prefill(saved)       # done by the caller, per sample
+    decoder.forward(input_ids)        # starts at the cache's length
 
 The backend owns its cache; this module never constructs or inspects one.
 """
@@ -44,8 +44,8 @@ def generate(
 ) -> Prediction:
     """Greedy-decode an answer after the attached prefix and ``answer_prefix``.
 
-    The caller must have attached the cache with ``decoder.set_kv_cache``;
-    ``forward`` starts at that cache's ``length``.
+    The caller must have loaded the sample's cache with
+    ``decoder.load_prefill``; ``forward`` starts at that cache's ``length``.
     """
     prefix_ids = tokenizer.encode(sample.answer_prefix, add_special_tokens=False)
     if not prefix_ids:

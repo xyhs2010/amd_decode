@@ -6,8 +6,8 @@ Run from the repo root:
 
 The second case is the template for a custom layer: subclass ``Qwen35Torch``,
 keep the ``_layer`` signature, and let ``align`` prove the new maths matches the
-reference before wiring it into the hot path.  Decode/cache comparisons return
-once the Qwen3.5 cache lands.
+reference before wiring it into the hot path.  Pass a ``SavedKVCache`` as
+``align``'s third argument to compare both backends on a seeded cache.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ class SameQwen35(Qwen35Torch):
         if self.cfg.is_full_attention[layer_idx]:
             mixer = self._full_attn(n, p, cos, sin, kv, layer_idx, past)
         else:
-            mixer = self._delta_net(n, p, kv, layer_idx)
+            mixer = self._delta_net(n, p, layer_idx)
         x = h + mixer
 
         h = x

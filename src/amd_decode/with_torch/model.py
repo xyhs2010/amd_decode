@@ -21,10 +21,9 @@ import torch.nn.functional as F
 from .. import DecodeModel
 from .config import Qwen35Config
 from .int4 import dequantize_int4, pack_int4, quantize_int4, unpack_int4
+from .kv_cache import KVCache
 from .rope import apply_rope, build_cos_sin
 from .weights import EMBED, FINAL_NORM, LM_HEAD, Qwen35Weights
-
-_ATTACHED = object()
 
 
 def _quantizable(tensor: torch.Tensor) -> bool:
@@ -58,23 +57,45 @@ class Qwen35Torch(DecodeModel):
         self.num_layers = self.cfg.num_hidden_layers
 
         # DecodeModel protocol state (see amd_decode.align).
-        self._kv = None
+        self._kv: KVCache | None = None
+        self._delta: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
         self._hook = None
         self._features: dict[int, object] = {}
 
     # ------------------------------------------------------------- align protocol
 
-    def set_kv_cache(self, kv) -> None:
-        self._kv = kv
+    def load_prefill(self, saved=None, max_len: int | None = None) -> None:
+        """Build and seed the cache from an offline prefill; ``None`` clears it."""
+        if saved is None:
+            self._kv = None
+            self._delta = None
+            return
+
+        self._kv = self._new_kv_cache(max_len)
+        self._delta = {}
+        for layer_idx in range(saved.num_layers):
+            tensors = saved.layer_tensors(layer_idx)
+            if "k" in tensors:
+                self._kv.append(
+                    layer_idx,
+                    tensors["k"].to(self.device, self.dtype),
+                    tensors["v"].to(self.device, self.dtype),
+                )
+            else:
+                self._delta[layer_idx] = (
+                    tensors["conv_state"].to(self.device, self.dtype),
+                    tensors["recurrent_state"].to(self.device),
+                )
+
+    def _new_kv_cache(self, max_len: int) -> KVCache:
+        """K/V storage for the full-attention layers; ``with_host`` overrides."""
+        return KVCache(max_len)
 
     def set_hook(self, hook) -> None:
         self._hook = hook
 
     def get_features(self) -> dict[int, object]:
         return self._features
-
-    def make_kv_cache(self, max_len: int, batch_size: int = 1):
-        raise NotImplementedError("the Qwen3.5 cache is the next step")
 
     # ------------------------------------------------------------ weight loading
 
@@ -234,14 +255,20 @@ class Qwen35Torch(DecodeModel):
             out.append((state * q[:, t].unsqueeze(-1)).sum(dim=-2))
         return torch.stack(out, dim=1), state
 
-    def _delta_net(self, x, p, kv, layer_idx):
+    def _delta_net(self, x, p, layer_idx):
         batch, seq, _ = x.shape
         cfg = self.cfg
         key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
         value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
 
-        conv_state = None if kv is None else kv.conv(layer_idx)
-        recurrent_state = None if kv is None else kv.state(layer_idx)
+        conv_state = recurrent_state = None
+        if self._delta is not None:
+            conv_state, recurrent_state = self._delta.get(layer_idx, (None, None))
+            if conv_state is None:
+                conv_state = torch.zeros(
+                    batch, key_dim * 2 + value_dim, cfg.linear_conv_kernel_dim,
+                    dtype=x.dtype, device=x.device,
+                )
 
         mixed = self.linear(x, p["linear_attn.in_proj_qkv.weight"])
         mixed = self._causal_conv(mixed, p["linear_attn.conv1d.weight"], conv_state)
@@ -260,8 +287,8 @@ class Qwen35Torch(DecodeModel):
         )
 
         out, recurrent_state = self._delta_rule(q, k, v, g, beta, recurrent_state)
-        if kv is not None:
-            kv.set_state(layer_idx, recurrent_state)
+        if self._delta is not None:
+            self._delta[layer_idx] = (conv_state, recurrent_state)
 
         out = self._rms_gated(out.to(x.dtype), p["linear_attn.norm.weight"], z)
         return self.linear(out.reshape(batch, seq, value_dim),
@@ -275,7 +302,7 @@ class Qwen35Torch(DecodeModel):
         if self.cfg.is_full_attention[layer_idx]:
             mixer = self._full_attn(n, p, cos, sin, kv, layer_idx, past)
         else:
-            mixer = self._delta_net(n, p, kv, layer_idx)
+            mixer = self._delta_net(n, p, layer_idx)
         x = h + mixer
 
         h = x
@@ -294,11 +321,9 @@ class Qwen35Torch(DecodeModel):
         self,
         input_ids: torch.Tensor | list[int],
         position_offset: int | None = None,
-        kv=_ATTACHED,
         logits_to_keep: int | None = None,
     ) -> torch.Tensor:
-        if kv is _ATTACHED:
-            kv = self._kv
+        kv = self._kv
         if position_offset is None:
             position_offset = 0 if kv is None else kv.length
         self._features = {}

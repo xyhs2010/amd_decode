@@ -1,6 +1,6 @@
 """Data-format readers shared by all decode backends."""
 
-from .prefill_cache import SavedKVCache, expand_block_scale
+from .prefill_cache import SavedKVCache
 from .safetensor_io import SafeTensorsFile
 
-__all__ = ["SavedKVCache", "SafeTensorsFile", "expand_block_scale"]
+__all__ = ["SavedKVCache", "SafeTensorsFile"]
