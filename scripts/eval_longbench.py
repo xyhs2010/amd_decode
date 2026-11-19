@@ -23,9 +23,10 @@ from amd_decode.bench import EvalConfig, EvalReport, QwenTokenizer, evaluate
 from amd_decode.bench.longbench import load_longbench_samples
 from amd_decode.utils import SavedKVCache
 from amd_decode.with_hip import HipQwen35
+from amd_decode.with_sparse import NaiveIvfPolicy, SparseQwen35
 from amd_decode.with_torch import Qwen35Torch
 
-IMPLS = {"device": Qwen35Torch, "hip": HipQwen35}
+IMPLS = {"device": Qwen35Torch, "hip": HipQwen35, "sparse": SparseQwen35}
 
 
 def main() -> None:
@@ -39,6 +40,9 @@ def main() -> None:
     parser.add_argument("--lengths", type=int, nargs="+", default=[])
     parser.add_argument("--exclude", nargs="*", default=[],
                         help="sample ids to skip (e.g. ones already scored)")
+    parser.add_argument("--index-dir", default="data/ivf",
+                        help="sparse only: IVF indices written by "
+                             "scripts/build_ivf_index.py")
     parser.add_argument("--max-new-tokens", type=int, default=None)
     args = parser.parse_args()
 
@@ -55,6 +59,11 @@ def main() -> None:
 
     def prepare(sample) -> None:
         saved = SavedKVCache(sample.cache_path)
+        if isinstance(decoder, SparseQwen35):
+            # One index per sample: loaded if already built, else built here
+            # (very slow at long contexts - run build_ivf_index.py first).
+            decoder.policy = NaiveIvfPolicy(
+                index_file=Path(args.index_dir) / f"{sample.sample_id}.pt")
         prefix = len(tokenizer.encode(sample.answer_prefix, add_special_tokens=False))
         decoder.load_prefill(
             saved, saved.seq_len + prefix + sample.max_new_tokens + 2)

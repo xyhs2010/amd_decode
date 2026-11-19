@@ -50,4 +50,14 @@ class KVCache:
         v_buf[:, :, pos : pos + n].copy_(v)
         self._len[layer_idx] = pos + n
         self.length = pos + n
-        return k_buf[:, :, : pos + n], v_buf[:, :, : pos + n]
+        return self.prefix(layer_idx)
+
+    @property
+    def layers(self) -> list[int]:
+        """Layer indices that own K/V (the 8 full-attention layers once seeded)."""
+        return sorted(self._len)
+
+    def prefix(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The layer's cached K/V ``[1, H, n, D]`` as fp16 views."""
+        n = self._len.get(layer_idx, 0)
+        return self._k[layer_idx][:, :, :n], self._v[layer_idx][:, :, :n]
