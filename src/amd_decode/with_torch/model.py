@@ -123,18 +123,11 @@ class Qwen35Torch(DecodeModel):
     # --------------------------------------------------------------------- norms
 
     def _rms(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        """Zero-centred RMSNorm (input/post/final)."""
+        """Zero-centred RMSNorm (input/post/final/q_norm/k_norm)."""
         xf = x.float()
         var = xf.pow(2).mean(dim=-1, keepdim=True)
         xf = xf * torch.rsqrt(var + self.cfg.rms_norm_eps)
         return (xf * (1.0 + weight.float())).to(x.dtype)
-
-    def _qk_rms(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        """Plain RMSNorm used by q_norm / k_norm."""
-        xf = x.float()
-        var = xf.pow(2).mean(dim=-1, keepdim=True)
-        xf = xf * torch.rsqrt(var + self.cfg.rms_norm_eps)
-        return weight * xf.to(x.dtype)
 
     def _rms_gated(self, x: torch.Tensor, weight: torch.Tensor,
                    gate: torch.Tensor) -> torch.Tensor:
@@ -176,12 +169,12 @@ class Qwen35Torch(DecodeModel):
             batch, seq, heads, 2 * head_dim
         )
         q, gate = qg.chunk(2, dim=-1)
-        q = self._qk_rms(q, p["self_attn.q_norm.weight"]).transpose(1, 2)
+        q = self._rms(q, p["self_attn.q_norm.weight"]).transpose(1, 2)
 
         k = self.linear(x, p["self_attn.k_proj.weight"]).view(
             batch, seq, kv_heads, head_dim
         )
-        k = self._qk_rms(k, p["self_attn.k_norm.weight"]).transpose(1, 2)
+        k = self._rms(k, p["self_attn.k_norm.weight"]).transpose(1, 2)
         v = self.linear(x, p["self_attn.v_proj.weight"]).view(
             batch, seq, kv_heads, head_dim
         ).transpose(1, 2)
