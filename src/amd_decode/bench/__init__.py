@@ -4,6 +4,7 @@ This package is about *quality*, not speed:
 
 * :mod:`amd_decode.bench.tokenizer` — dependency-free Qwen3 tokenizer;
 * :mod:`amd_decode.bench.ruler` — RULER adapter over ``data/kv_cache``;
+* :mod:`amd_decode.bench.longbench` — LongBench v2 adapter;
 * :mod:`amd_decode.bench.generate` — greedy decode through ``DecodeModel``;
 * :mod:`amd_decode.bench.runner` — evaluate + score;
 * :mod:`amd_decode.bench.types` — samples, results and the report;
@@ -16,7 +17,8 @@ The runner is benchmark-agnostic and cache-agnostic.  A backend only implements
 
 from .. import DecodeModel
 from .generate import generate
-from .metrics import METRICS, get_metric, string_match_all, string_match_part
+from .longbench import load_longbench_samples
+from .metrics import METRICS, get_metric, letter_match, string_match_all, string_match_part
 from .ruler import discover_ruler_caches, load_ruler_samples, ruler_task_spec
 from .runner import EvalConfig, evaluate
 from .tokenizer import QwenTokenizer
@@ -35,6 +37,8 @@ __all__ = [
     "evaluate",
     "generate",
     "get_metric",
+    "letter_match",
+    "load_longbench_samples",
     "load_ruler_samples",
     "ruler_task_spec",
     "string_match_all",
