@@ -27,6 +27,10 @@ Examples::
 
     python prefill/prefill_qwen35.py --model data/models/Qwen3.5-9B \
         --benchmark jsonl --jsonl data/raw/longbench_v2/prompts_256k.jsonl
+
+    # same, but wrap each prompt in the chat template (thinking on)
+    python prefill/prefill_qwen35.py --model data/models/Qwen3.5-9B \
+        --benchmark jsonl --jsonl ... --chat --tag Qwen3.5-9B-chat
 """
 
 from __future__ import annotations
@@ -170,6 +174,8 @@ def main() -> None:
                     help="any torch device string for this machine")
     ap.add_argument("--dtype", default="bfloat16",
                     choices=("bfloat16", "float16"))
+    ap.add_argument("--chat", action="store_true",
+                    help="wrap the prompt in the chat template with thinking on")
     args = ap.parse_args()
 
     if args.benchmark == "jsonl" and not args.jsonl:
@@ -194,7 +200,13 @@ def main() -> None:
 
     built = skipped = 0
     for sample in samples:
-        ids = tokenizer(sample["prompt"], add_special_tokens=False)["input_ids"]
+        text = sample["prompt"]
+        if args.chat:
+            text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                tokenize=False, add_generation_prompt=True,
+                enable_thinking=True)
+        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
         if not ids:
             print(f"[skip] {sample['sample_id']}: empty prompt")
             skipped += 1
@@ -224,6 +236,8 @@ def main() -> None:
             "model": str(args.model),
             "dtype": args.dtype,
             "chunk_size": args.chunk_size,
+            "chat_template": "chat" if args.chat else "raw",
+            "enable_thinking": bool(args.chat),
             "num_layers": num_layers,
             "layer_types": layer_types,
             "num_kv_heads": text_cfg.num_key_value_heads,

@@ -76,11 +76,9 @@ class Qwen35Torch(DecodeModel):
         for layer_idx in range(saved.num_layers):
             tensors = saved.layer_tensors(layer_idx)
             if "k" in tensors:
-                self._kv.append(
-                    layer_idx,
-                    tensors["k"].to(self.device, self.dtype),
-                    tensors["v"].to(self.device, self.dtype),
-                )
+                # copy_ converts and uploads in one step: no 500 MiB GPU temp
+                # per tensor (two of them at once is what tipped 262144 over).
+                self._kv.append(layer_idx, tensors["k"], tensors["v"])
             else:
                 self._delta[layer_idx] = (
                     tensors["conv_state"].to(self.device, self.dtype),
