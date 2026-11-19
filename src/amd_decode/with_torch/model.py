@@ -353,7 +353,7 @@ class Qwen35Torch(DecodeModel):
 
         x = self._rms(x, self.final_norm.to(self.device).to(self.dtype))
         lm_head = self._prepare(LM_HEAD, self.lm_head)
-        logits = F.linear(x, lm_head)
+        logits = self.linear(x, lm_head)
         del lm_head
 
         if logits_to_keep is not None:
