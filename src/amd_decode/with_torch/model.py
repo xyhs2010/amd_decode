@@ -165,12 +165,29 @@ class Qwen35Torch(DecodeModel):
                    v_all: torch.Tensor, past: int) -> torch.Tensor:
         """GQA softmax attention; returns [B, T, H * D] before o_proj.
 
-        Query heads are grouped per KV head and the KV tensors broadcast, so the
-        4x expanded K/V is never materialised (it would be ~4 GiB at 262144).
+        Decode runs one 2-D matmul per KV head, so K/V are streamed once and the
+        4x expanded tensors are never materialised (they cost ~4 GiB at 262144
+        and pushed the allocator into thrashing).  Prefill broadcasts the query
+        heads over the KV heads instead.
         """
         batch, heads, seq, head_dim = q.shape
-        rep = heads // k_all.shape[1]
-        qg = q.view(batch, k_all.shape[1], rep, seq, head_dim)
+        kv_heads = k_all.shape[1]
+        rep = heads // kv_heads
+
+        if seq == 1 and batch == 1:
+            outs = []
+            for h in range(kv_heads):
+                qh = q[0, h * rep : (h + 1) * rep, 0]              # [rep, D]
+                kh = k_all[0, h]                                   # [T, D]
+                scores = torch.matmul(qh, kh.transpose(0, 1))
+                scores = scores / math.sqrt(head_dim)
+                probs = torch.softmax(scores, dim=-1,
+                                      dtype=torch.float32).to(q.dtype)
+                outs.append(torch.matmul(probs, v_all[0, h]))      # [rep, D]
+            out = torch.stack(outs, dim=0).reshape(heads, head_dim)
+            return out.view(1, 1, heads * head_dim)
+
+        qg = q.view(batch, kv_heads, rep, seq, head_dim)
 
         scores = torch.matmul(qg, k_all.unsqueeze(2).transpose(-2, -1))
         scores = scores / math.sqrt(head_dim)
@@ -184,6 +201,15 @@ class Qwen35Torch(DecodeModel):
         out = torch.matmul(probs, v_all.unsqueeze(2))
         out = out.view(batch, heads, seq, head_dim).transpose(1, 2)
         return out.reshape(batch, seq, heads * head_dim)
+
+    def _decode_attn(self, q: torch.Tensor, kv: KVCache,
+                     layer_idx: int) -> torch.Tensor:
+        """Single-token attention over the cached prefix, before the output gate.
+
+        A sparse backend overrides this to read only the selected tokens.
+        """
+        k_all, v_all = kv.prefix(layer_idx)
+        return self._attention(q, k_all, v_all, 0)
 
     def _full_attn(self, x, p, cos, sin, kv, layer_idx, past):
         batch, seq, _ = x.shape
@@ -213,7 +239,9 @@ class Qwen35Torch(DecodeModel):
         else:
             k_all, v_all = kv.append(layer_idx, k, v)
 
-        out = self._attention(q, k_all, v_all, past)
+        out = (self._decode_attn(q, kv, layer_idx)
+               if kv is not None and seq == 1
+               else self._attention(q, k_all, v_all, past))
         out = out * torch.sigmoid(gate.reshape(batch, seq, heads * head_dim))
         return self.linear(out, p["self_attn.o_proj.weight"])
 
