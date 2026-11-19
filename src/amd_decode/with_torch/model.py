@@ -163,13 +163,17 @@ class Qwen35Torch(DecodeModel):
 
     def _attention(self, q: torch.Tensor, k_all: torch.Tensor,
                    v_all: torch.Tensor, past: int) -> torch.Tensor:
-        """GQA softmax attention; returns [B, T, H * D] before o_proj."""
-        batch, heads, seq, head_dim = q.shape
-        rep = self.cfg.num_key_value_groups
-        k = k_all.repeat_interleave(rep, dim=1)
-        v = v_all.repeat_interleave(rep, dim=1)
+        """GQA softmax attention; returns [B, T, H * D] before o_proj.
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        Query heads are grouped per KV head and the KV tensors broadcast, so the
+        4x expanded K/V is never materialised (it would be ~4 GiB at 262144).
+        """
+        batch, heads, seq, head_dim = q.shape
+        rep = heads // k_all.shape[1]
+        qg = q.view(batch, k_all.shape[1], rep, seq, head_dim)
+
+        scores = torch.matmul(qg, k_all.unsqueeze(2).transpose(-2, -1))
+        scores = scores / math.sqrt(head_dim)
         if seq > 1:
             qpos = torch.arange(past, past + seq, device=q.device)
             kpos = torch.arange(0, past + seq, device=q.device)
@@ -177,8 +181,9 @@ class Qwen35Torch(DecodeModel):
                                         torch.finfo(scores.dtype).min)
 
         probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = torch.matmul(probs, v)
-        return out.transpose(1, 2).reshape(batch, seq, heads * head_dim)
+        out = torch.matmul(probs, v_all.unsqueeze(2))
+        out = out.view(batch, heads, seq, head_dim).transpose(1, 2)
+        return out.reshape(batch, seq, heads * head_dim)
 
     def _full_attn(self, x, p, cos, sin, kv, layer_idx, past):
         batch, seq, _ = x.shape
