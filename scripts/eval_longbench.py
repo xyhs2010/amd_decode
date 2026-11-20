@@ -19,8 +19,8 @@ sampling settings, with ``repetition_penalty=1.0`` throughout:
     non-thinking, reasoning          1.0         1.0         40        0            2.0
 
 ``max_new_tokens`` 32768 (81920 for hard benchmarks); ``presence_penalty``
-0..2 only damps endless repetition.  This script generates greedily (argmax,
-no sampling); a sampled run needs ``transformers.generate`` with those kwargs.
+0..2 only damps endless repetition.  ``--nothink`` selects the non-thinking
+general row, otherwise the thinking general row; sampling uses a fixed seed.
 """
 
 from __future__ import annotations
@@ -34,19 +34,19 @@ from pathlib import Path
 import torch
 
 from amd_decode.bench import EvalConfig, EvalReport, QwenTokenizer, evaluate
+from amd_decode.bench.generate import SamplingConfig
 from amd_decode.bench.longbench import load_longbench_samples
 from amd_decode.utils import SavedKVCache
 from amd_decode.with_hip import HipQwen35
 from amd_decode.with_sparse import NaiveIvfPolicy, SparseQwen35
 from amd_decode.with_torch import Qwen35Torch
 
-IMPLS = {"device": Qwen35Torch, "hip": HipQwen35, "sparse": SparseQwen35}
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--impl", default="hip", choices=sorted(IMPLS))
+    parser.add_argument("--impl", default="hip",
+                        choices=("device", "hip", "sparse"))
     parser.add_argument("--model-dir", default="data/models/Qwen3.5-9B")
     parser.add_argument("--cache-root",
                         default="data/kv_cache/Qwen3.5-9B/bfloat16/jsonl")
@@ -72,9 +72,24 @@ def main() -> None:
     if not samples:
         raise SystemExit("no saved LongBench v2 caches found")
 
+    decode_args = {"model_dir": args.model_dir, "device": "cuda", "dtype": torch.float16}
+    if args.impl == "device":
+        decoder = Qwen35Torch(**decode_args)
+    elif args.impl == "hip":
+        decoder = HipQwen35(**decode_args)
+    elif args.impl == "sparse":
+        decoder = SparseQwen35(**decode_args)
+    else:
+        raise Exception(f"Impl {args.impl} not supported")
     tokenizer = QwenTokenizer(args.model_dir)
-    decoder = IMPLS[args.impl](args.model_dir, device="cuda", dtype=torch.float16)
-    config = EvalConfig(max_new_tokens=args.max_new_tokens, verbose=True)
+    sampling = SamplingConfig(
+        temperature=0.7 if args.nothink else 1.0,
+        top_p=0.8 if args.nothink else 0.95,
+        top_k=20,
+        presence_penalty=1.5,
+    )
+    config = EvalConfig(max_new_tokens=args.max_new_tokens, verbose=True,
+                        sampling=sampling)
 
     def prepare(sample) -> None:
         saved = SavedKVCache(sample.cache_path)
@@ -84,8 +99,8 @@ def main() -> None:
             decoder.policy = NaiveIvfPolicy(
                 index_file=Path(args.index_dir) / f"{sample.sample_id}.pt")
         prefix = len(tokenizer.encode(sample.answer_prefix, add_special_tokens=False))
-        decoder.load_prefill(
-            saved, saved.seq_len + prefix + sample.max_new_tokens + 2)
+        budget = args.max_new_tokens or sample.max_new_tokens
+        decoder.load_prefill(saved, saved.seq_len + prefix + budget + 2)
 
     by_length: dict[int, list] = defaultdict(list)
     for sample in samples:

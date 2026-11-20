@@ -8,7 +8,7 @@ from typing import Callable, Iterable, Optional
 import torch
 
 from .. import DecodeModel
-from .generate import generate
+from .generate import SamplingConfig, generate
 from .metrics import get_metric
 from .types import EvalReport, EvalSample, SampleResult
 
@@ -19,6 +19,7 @@ class EvalConfig:
 
     #: Override every sample's ``max_new_tokens`` (debug only; changes scores).
     max_new_tokens: int | None = None
+    sampling: SamplingConfig | None = None
     empty_cache: bool = True
     verbose: bool = True
 
@@ -61,6 +62,7 @@ def evaluate(
                 tokenizer,
                 sample,
                 max_new_tokens=config.max_new_tokens,
+                sampling=config.sampling,
             )
         except torch.cuda.OutOfMemoryError as exc:
             raise RuntimeError(
