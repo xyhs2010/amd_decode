@@ -60,8 +60,11 @@ def main() -> None:
 
     settings = dict(device=args.device, dtype=torch.float16)
     dense = HipQwen35(args.model_dir, **settings)
+    # The cache grows one token per decode step, so cover the whole run.
     every = SparseQwen35(
-        args.model_dir, policy=WindowPolicy(window=saved.seq_len, sink=0), **settings
+        args.model_dir,
+        policy=WindowPolicy(window=saved.seq_len + len(args.tokens) + 1, sink=0),
+        **settings,
     )
     # One packed-weight cache for all instances: three copies would not fit.
     every._int4_cache = dense._int4_cache
