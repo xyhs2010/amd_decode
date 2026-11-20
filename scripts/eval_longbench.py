@@ -8,6 +8,19 @@ Run from the repo root:
 Only samples that already have a KV cache are scored (the caches under
 ``data/kv_cache``), against the labels in ``metadata.jsonl``.  Each length group
 prints its summary as soon as it finishes.
+
+The current caches use the raw official template.  For chat-template caches
+(``enable_thinking`` at prefill time) the Qwen3.5-9B card recommends these
+sampling settings, with ``repetition_penalty=1.0`` throughout:
+
+    thinking, general      temperature 1.0  top_p 0.95  top_k 20  min_p 0  presence 1.5
+    thinking, precise code           0.6         0.95        20        0            0.0
+    non-thinking, general            0.7         0.8         20        0            1.5
+    non-thinking, reasoning          1.0         1.0         40        0            2.0
+
+``max_new_tokens`` 32768 (81920 for hard benchmarks); ``presence_penalty``
+0..2 only damps endless repetition.  This script generates greedily (argmax,
+no sampling); a sampled run needs ``transformers.generate`` with those kwargs.
 """
 
 from __future__ import annotations
@@ -15,6 +28,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -44,10 +58,15 @@ def main() -> None:
                         help="sparse only: IVF indices written by "
                              "scripts/build_ivf_index.py")
     parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument("--nothink", action="store_true",
+                        help="chat-template caches (thinking on): feed the 3 tokens "
+                             "that close the empty think block before decoding")
     args = parser.parse_args()
 
     samples = load_longbench_samples(
         args.cache_root, args.metadata, lengths=tuple(args.lengths))
+    if args.nothink:
+        samples = [replace(s, answer_prefix="\n</think>\n\n") for s in samples]
     excluded = set(args.exclude)
     samples = [s for s in samples if s.sample_id not in excluded]
     if not samples:

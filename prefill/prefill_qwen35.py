@@ -134,9 +134,13 @@ def save_sample(path: Path, cache, layer_types, meta: dict, tokens: list[int]) -
             tensors = {"k": layer.keys.detach().cpu(),
                        "v": layer.values.detach().cpu()}
         else:
+            # transformers 5.13 stores the per-batch state without the batch
+            # dim; the reader (and older caches) expect [1, ...].
+            conv = layer.conv_states[0].detach().cpu()
+            rec = layer.recurrent_states[0].detach().cpu()
             tensors = {
-                "conv_state": layer.conv_states[0].detach().cpu(),
-                "recurrent_state": layer.recurrent_states[0].detach().cpu(),
+                "conv_state": conv.unsqueeze(0) if conv.dim() == 2 else conv,
+                "recurrent_state": rec.unsqueeze(0) if rec.dim() == 3 else rec,
             }
         save_file({name: t.contiguous() for name, t in tensors.items()},
                   str(tmp / f"layer_{layer_idx:02d}.safetensors"))

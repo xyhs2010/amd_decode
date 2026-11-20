@@ -55,9 +55,11 @@ def generate(
     if limit < 1:
         raise ValueError(f"{sample.sample_id}: generation budget must be >= 1")
 
-    # The answer prefix is fed as one short prefill on top of the saved prompt.
-    logits = decoder.forward(prefix_ids)
-    last = _last_logits(logits)
+    # Feed the prefix one token at a time: a multi-token forward takes the
+    # dense prefill attention, which is expensive on a 256K cache and OOMs the
+    # kernel backends.  Token-by-token decode is equivalent for causal models.
+    for token_id in prefix_ids:
+        last = _last_logits(decoder.forward([token_id]))
 
     generated: list[int] = []
     for _ in range(limit):
