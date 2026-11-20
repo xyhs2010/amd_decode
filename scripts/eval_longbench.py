@@ -21,6 +21,9 @@ sampling settings, with ``repetition_penalty=1.0`` throughout:
 ``max_new_tokens`` 32768 (81920 for hard benchmarks); ``presence_penalty``
 0..2 only damps endless repetition.  ``--nothink`` selects the non-thinking
 general row, otherwise the thinking general row; sampling uses a fixed seed.
+
+The think block is force-closed after ``THINK_BUDGET`` generated tokens: the
+close tokens are fed as context and the answer continues from there.
 """
 
 from __future__ import annotations
@@ -40,6 +43,51 @@ from amd_decode.utils import SavedKVCache
 from amd_decode.with_hip import HipQwen35
 from amd_decode.with_sparse import NaiveIvfPolicy, SparseQwen35
 from amd_decode.with_torch import Qwen35Torch
+
+#: Generated tokens allowed inside ``<think>`` before it is force-closed.
+THINK_BUDGET = 3072
+
+_CLOSE = "\n</think>\n\n"
+
+
+class _ThinkingCap:
+    """Decoder wrapper that closes an open think block after ``budget`` tokens.
+
+    The close tokens are fed as context, so the answer starts from a model that
+    has seen ``</think>``; they are not part of the generated tokens.  ``reset``
+    is called per sample with the answer-prefix length, which is fed before
+    generation starts.
+    """
+
+    def __init__(self, decoder, tokenizer, budget: int) -> None:
+        self.decoder = decoder
+        self.device = getattr(decoder, "device", None)
+        self._close_ids = tokenizer.encode(_CLOSE, add_special_tokens=False)
+        self._end_ids = set(tokenizer.encode("</think>", add_special_tokens=False))
+        self._budget = budget
+        self.reset(0)
+
+    def reset(self, prefix_len: int) -> None:
+        self._skip = prefix_len
+        self._count = 0
+        self._done = False
+
+    def forward(self, input_ids, position_offset=None):
+        logits = self.decoder.forward(input_ids, position_offset)
+        ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+        for token in ids:
+            if self._skip:
+                self._skip -= 1
+            elif not self._done:
+                if token in self._end_ids:
+                    self._done = True
+                else:
+                    self._count += 1
+                    if self._count >= self._budget:
+                        for close_id in self._close_ids:
+                            logits = self.decoder.forward([close_id])
+                        self._done = True
+        return logits
 
 
 def main() -> None:
@@ -82,6 +130,8 @@ def main() -> None:
     else:
         raise Exception(f"Impl {args.impl} not supported")
     tokenizer = QwenTokenizer(args.model_dir)
+    # ``--nothink`` already closes the block before decoding; otherwise cap it.
+    model = decoder if args.nothink else _ThinkingCap(decoder, tokenizer, THINK_BUDGET)
     sampling = SamplingConfig(
         temperature=0.7 if args.nothink else 1.0,
         top_p=0.8 if args.nothink else 0.95,
@@ -99,8 +149,10 @@ def main() -> None:
             decoder.policy = NaiveIvfPolicy(
                 index_file=Path(args.index_dir) / f"{sample.sample_id}.pt")
         prefix = len(tokenizer.encode(sample.answer_prefix, add_special_tokens=False))
+        if isinstance(model, _ThinkingCap):
+            model.reset(prefix)
         budget = args.max_new_tokens or sample.max_new_tokens
-        decoder.load_prefill(saved, saved.seq_len + prefix + budget + 2)
+        decoder.load_prefill(saved, saved.seq_len + prefix + budget + 8)
 
     by_length: dict[int, list] = defaultdict(list)
     for sample in samples:
@@ -115,7 +167,7 @@ def main() -> None:
         skipped: list[str] = []
         for sample in group:
             try:
-                part = evaluate(decoder, tokenizer, [sample], config=config,
+                part = evaluate(model, tokenizer, [sample], config=config,
                                 prepare=prepare)
             except Exception as exc:
                 print(f"SKIP {sample.sample_id}: {type(exc).__name__}: {exc}",

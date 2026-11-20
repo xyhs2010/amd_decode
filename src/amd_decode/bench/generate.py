@@ -132,7 +132,13 @@ def generate(
         logits = decoder.forward([next_id])
         last = _last_logits(logits)
 
-    text = tokenizer.decode(generated, skip_special_tokens=True)
+    # Qwen3.5 answer rule: score the text after the last ``</think>``.  The
+    # token is special, so it is not in the decoded text; trim by id instead.
+    end_ids = tokenizer.encode("</think>", add_special_tokens=False)
+    cut = -1
+    if len(end_ids) == 1:
+        cut = max((i for i, t in enumerate(generated) if t == end_ids[0]), default=-1)
+    text = tokenizer.decode(generated[cut + 1 :], skip_special_tokens=True)
     for stop in sample.stop:
         text = text.split(stop)[0]
     return Prediction(

@@ -41,9 +41,9 @@ _BARE_LETTER = re.compile(r"\b([A-D])\b")
 def letter_match(prediction: str, references: Sequence[str]) -> float:
     """LongBench v2: the predicted choice letter must match the label.
 
-    A reasoning model often names choices on the way ("option (B) says ..."),
-    so the *last* answer wins: the final formatted line if there is one,
-    otherwise the last parenthesised or bare letter.
+    Qwen3.5 recommends scoring the first answer after the last ``</think>``;
+    :func:`generate` already trims the prediction to that segment, so the first
+    formatted/parenthesised/bare letter wins.
     """
     if not references:
         return 0.0
@@ -52,7 +52,7 @@ def letter_match(prediction: str, references: Sequence[str]) -> float:
         or _LETTER.findall(prediction)
         or _BARE_LETTER.findall(prediction.upper())
     )
-    return 1.0 if letters and letters[-1].upper() == references[0].upper() else 0.0
+    return 1.0 if letters and letters[0].upper() == references[0].upper() else 0.0
 
 
 METRICS: dict[str, Metric] = {
