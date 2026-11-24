@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "用 AMD gpu 做 decode"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "safetensors>=0.8.0"
+]
 
 [project.scripts]
 amd-decode = "amd_decode:main"
