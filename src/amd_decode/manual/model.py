@@ -24,13 +24,13 @@ class Qwen35Xyhs(DecodeModel):
 
         self.num_layers = self.cfg.num_hidden_layers
 
-    @torch.inference_mode()
     def forward(
-        self, input_ids: torch.Tensor | list[int], position_offset: int | None = None
+        self, input_ids: torch.Tensor | list[int], position_offset: list[int] | None = None
     ):
-        from ..with_torch.rope import build_cos_sin
+        from .full_attn import Rope
         
         """只做 decode"""
+        Rope.build_cos_sin(torch.as_tensor(position_offset, dtype=torch.long))
         ids = torch.as_tensor(input_ids, dtype=torch.long)
         if ids.dim() == 2:
             assert (
@@ -41,7 +41,5 @@ class Qwen35Xyhs(DecodeModel):
             ids.dim() == 1
         ), f"Input ids must be 1-D or 2-D, got shape {tuple(ids.shape)}"
         x = self.embed[ids.cpu()].to(self.device).to(self.dtype)
-
-        cos, sin = build_cos_sin([position_offset], self.cfg, self.dtype)
 
         

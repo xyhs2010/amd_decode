@@ -10,8 +10,7 @@ from pathlib import Path
 import torch
 
 
-
-class Qwen35WeightsXyhs:
+class Qwen35Weights:
     def __init__(self, model_dir: str | Path) -> None:
         self.state_dict = self.load(model_dir)
 

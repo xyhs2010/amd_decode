@@ -22,9 +22,10 @@ class Q4Weight:
         self.odim, self.idim = weight.shape
         self.int4_w, self.zero_points, self.scales = self.quant(weight)
 
-    def to(self, *args, **kwargs):
-        for _ in (self.int4_w, self.scales, self.zero_points):
-            _.to(*args, **kwargs)
+    def to_gpu(self):
+        self.int4_w = self.int4_w.to("gpu")
+        self.zero_points = self.zero_points.to("gpu")
+        self.scales = self.scales.to("gpu")
 
     def dequant(self):
         qweight = self.unpack_int4(self.int4_w, self.idim)
