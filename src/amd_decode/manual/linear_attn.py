@@ -18,17 +18,17 @@ class DeltaNet(object):
         self.wmap: dict[str, torch.Tensor] = {}
         for wname in _LINEAR_ATTENTION:
             weights = wprovider.state_dict[f"{prefix}.{wname}"]
-            self.wmap[wname] = weights.cuda()
+            self.wmap[wname] = weights.to(dtype=torch.float16, device="cuda")
         self.conv_state = self.recurrent_state = None
 
     def load_prefill(
         self, kv_dict: dict[str, torch.Tensor], max_len: int | None = None
     ):
-        conv_state = kv_dict["conv_state"]
+        conv_state = kv_dict["conv_state"].to(dtype=torch.float16, device="cuda")
         shape = list(conv_state.shape)
         shape[-1] = 1
-        self.conv_state = torch.cat([conv_state, conv_state.new_zeros(shape)])
-        self.recurrent_state = kv_dict["recurrent_state"]
+        self.conv_state = torch.cat([conv_state, conv_state.new_zeros(shape)], dim=-1)
+        self.recurrent_state = kv_dict["recurrent_state"].half().cuda()
 
     def forward(self, x: torch.Tensor):
         from .function import rms_gated

@@ -23,9 +23,9 @@ class Q4Weight:
         self.int4_w, self.zero_points, self.scales = self.quant(weight)
 
     def to_gpu(self):
-        self.int4_w = self.int4_w.to("gpu")
-        self.zero_points = self.zero_points.to("gpu")
-        self.scales = self.scales.to("gpu")
+        self.int4_w = self.int4_w.to("cuda")
+        self.zero_points = self.zero_points.to("cuda")
+        self.scales = self.scales.to("cuda")
 
     def dequant(self):
         qweight = self.unpack_int4(self.int4_w, self.idim)
@@ -40,12 +40,12 @@ class Q4Weight:
         from math import log10
 
         odim, idim, group_size = self.odim, self.idim, self.group_size
-        groups = weight.float().view(odim, idim // group_size, group_size)
-        zero_points = groups.mean(dim=-1, keepdim=True)
+        groups = weight.cuda().float().view(odim, idim // group_size, group_size)
+        zero_points = groups.mean(dim=-1, keepdim=True).half()
 
-        min_scales = groups.std(dim=-1, keepdim=True) * 3 / QMAX
+        min_scales = groups.std(dim=-1, keepdim=True).half() * 3 / QMAX
         min_scales = min_scales.clamp_min(torch.finfo(torch.float16).tiny)
-        acc = torch.logspace(0, log10(3), self.nsteps)
+        acc = torch.logspace(0, log10(3), self.nsteps).half().cuda()
         scale_pool = min_scales[..., None] * acc  # 前 3 轴为 groups 形状
 
         group_ext = groups[..., None]

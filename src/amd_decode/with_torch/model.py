@@ -328,16 +328,24 @@ class Qwen35Torch(DecodeModel):
     # ---------------------------------------------------------------- layer glue
 
     def _layer(self, x, p, cos, sin, kv, layer_idx, past):
+        if layer_idx == 0:
+            print("start", x)
         h = x
         n = self._rms(x, p["input_layernorm.weight"])
+        if layer_idx == 0:
+            print("norm", n)
         if self.cfg.is_full_attention[layer_idx]:
             mixer = self._full_attn(n, p, cos, sin, kv, layer_idx, past)
         else:
             mixer = self._delta_net(n, p, layer_idx)
+        if layer_idx == 0:
+            print("attn", mixer)
         x = h + mixer
 
         h = x
         x = h + self._mlp(self._rms(x, p["post_attention_layernorm.weight"]), p)
+        if layer_idx == 0:
+            print("mlp", x)
         return x
 
     def _mlp(self, x, p):

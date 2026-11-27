@@ -3,11 +3,10 @@ from .. import DecodeModel
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
-from ..with_torch.weights import EMBED, FINAL_NORM, LM_HEAD, Qwen35Weights
+from .weights import EMBED, LM_HEAD, FINAL_NORM, Qwen35Weights
 from .ffn import FFN
-from .full_attn import FullAttn, Rope, KVCache
+from .full_attn import FullAttn, Rope
 from .linear_attn import DeltaNet
 from .function import rms
 from safetensors.torch import load_file
@@ -36,9 +35,9 @@ class Qwen35Xyhs(DecodeModel):
             for lid in range(NUM_LAYERS)
         ]
 
-        self.embed = self.weights.get(EMBED)
-        self.lm_head = self.weights.get(LM_HEAD)
-        self.final_norm = self.weights.get(FINAL_NORM)
+        self.embed = self.weights.state_dict[EMBED]
+        self.lm_head = self.weights.state_dict[LM_HEAD]
+        self.final_norm = self.weights.state_dict[FINAL_NORM]
 
     def load_prefill(self, kv_dir: str = None, max_len: int | None = None) -> None:
         kv_dir = Path(kv_dir)
@@ -55,9 +54,9 @@ class Qwen35Xyhs(DecodeModel):
         if position_offset == None:
             for attn in self.attn_list:
                 if isinstance(attn, FullAttn):
-                    position_offset = attn.kv_cache.offset
+                    position_offset = [attn.kv_cache.offset] * len(input_ids)
                     break
-        Rope.build_cos_sin(torch.as_tensor(position_offset, dtype=torch.long))
+        Rope.build_cos_sin(torch.as_tensor(position_offset, dtype=torch.long).cuda())
         ids = torch.as_tensor(input_ids, dtype=torch.long)
         if ids.dim() == 2:
             assert (
@@ -73,8 +72,12 @@ class Qwen35Xyhs(DecodeModel):
             ffn, attn = self.ffn_list[lid], self.attn_list[lid]
             input = rms(x, ffn.wmap["input_layernorm.weight"])
             out = attn.forward(input)
+            # if lid == 0:
+            #     print("attn", out)
             x = x + out
-            x = rms(x, ffn.wmap["post_attention_layernorm.weight"])
 
-            out = ffn.forward(x)
+            out = ffn.forward(rms(x, ffn.wmap["post_attention_layernorm.weight"]))
             x = x + out
+
+            # if lid == 0:
+            #     print("mlp", x)

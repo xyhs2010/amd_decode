@@ -18,7 +18,6 @@ class Rope(object):
     def build_cos_sin(
         cls,
         positions: torch.Tensor,
-        dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``positions``: 1-D absolute positions. Returns cos/sin of shape [T, 64]."""
         inv_freq = 1.0 / (
@@ -29,7 +28,7 @@ class Rope(object):
             * inv_freq.to(positions.device)[None, :]
         )
         emb = torch.cat((freqs, freqs), dim=-1)
-        cls.cos, cls.sin = emb.cos().to(dtype), emb.sin().to(dtype)
+        cls.cos, cls.sin = emb.cos().to(torch.float16), emb.sin().to(torch.float16)
 
     @classmethod
     def apply_rope(
@@ -54,13 +53,13 @@ class KVCache(object):
     def load_prefill(
         self, kv_dict: dict[str, torch.Tensor], max_len: int | None = None
     ):
-        k, v = kv_dict["k"], kv_dict["v"]
+        k, v = kv_dict["k"].half(), kv_dict["v"].half()
         shape = list(k.shape)
         self.offset = shape[2]
         shape[2] = max_len
 
         self._k = torch.empty(shape, dtype=k.dtype, device="cuda")
-        self._v = torch.empty_like(self.k)
+        self._v = torch.empty_like(self._k)
         self._k[:, :, : self.offset, :].copy_(k)
         self._v[:, :, : self.offset, :].copy_(v)
 
@@ -91,7 +90,7 @@ class FullAttn(object):
         self.wmap: dict[str, torch.Tensor] = {}
         for wname in _FULL_ATTENTION:
             weights = wprovider.state_dict[f"{prefix}.{wname}"]
-            self.wmap[wname] = weights.cuda()
+            self.wmap[wname] = weights.to(dtype=torch.float16, device="cuda")
         self.kv_cache = KVCache()
 
         self.qgkv_weight = torch.concat(
@@ -131,6 +130,6 @@ class FullAttn(object):
         scores = qgroup @ self.kv_cache.k.transpose(-1, -2) / sqrt(HEAD_DIM)
         probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
         out = (probs @ self.kv_cache.v).view(batch, NUM_Q_HEAD * HEAD_DIM)
-        out = out * torch.sigmoid(gate.view(batch, NUM_Q_HEAD * HEAD_DIM))
+        out = out * torch.sigmoid(gate).view(batch, NUM_Q_HEAD * HEAD_DIM)
         out = F.linear(out, self.wmap["self_attn.o_proj.weight"])
         return out
