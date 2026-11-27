@@ -19,7 +19,7 @@ class DeltaNet(object):
         for wname in _LINEAR_ATTENTION:
             weights = wprovider.state_dict[f"{prefix}.{wname}"]
             self.wmap[wname] = weights.to(dtype=torch.float16, device="cuda")
-        self.conv_state = self.recurrent_state = None
+        self.conv_buf = self.recurrent_state = None
 
     def load_prefill(
         self, kv_dict: dict[str, torch.Tensor], max_len: int | None = None
@@ -27,7 +27,7 @@ class DeltaNet(object):
         conv_state = kv_dict["conv_state"].to(dtype=torch.float16, device="cuda")
         shape = list(conv_state.shape)
         shape[-1] = 1
-        self.conv_state = torch.cat([conv_state, conv_state.new_zeros(shape)], dim=-1)
+        self.conv_buf = torch.cat([conv_state, conv_state.new_zeros(shape)], dim=-1)
         self.recurrent_state = kv_dict["recurrent_state"].half().cuda()
 
     def forward(self, x: torch.Tensor):
@@ -80,18 +80,18 @@ class DeltaNet(object):
 
     def conv(self, x: torch.Tensor):
         batch = x.shape[0]
-        if self.conv_state is None:
+        if self.conv_buf is None:
             mixed_dim = (NUM_LINEAR_KHEAD * 2 + NUM_LINEAR_VHEAD) * LINEAR_DIM
-            self.conv_state = torch.zeros(
+            self.conv_buf = torch.zeros(
                 (batch, mixed_dim, LINEAR_KERNEL_DIM + 1),
                 dtype=x.dtype,
                 device=x.device,
             )
 
         mixed = F.linear(x, self.wmap["linear_attn.in_proj_qkv.weight"])
-        self.conv_state[:, :, -1] = mixed
+        self.conv_buf[:, :, -1] = mixed
         conv_w = self.wmap["linear_attn.conv1d.weight"].squeeze(1)
-        conved = F.silu(self.conv_state[:, :, 1:] * conv_w).sum(dim=-1)
-        self.conv_state[:, :, :-1] = self.conv_state[:, :, 1:]
+        conved = F.silu((self.conv_buf[:, :, 1:] * conv_w).sum(dim=-1))
+        self.conv_buf[:, :, :-1] = self.conv_buf[:, :, 1:]
 
         return conved
