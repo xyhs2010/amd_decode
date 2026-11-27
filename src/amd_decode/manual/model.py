@@ -52,6 +52,11 @@ class Qwen35Xyhs(DecodeModel):
         position_offset: list[int] | None = None,
     ):
         """只做 decode"""
+        if position_offset == None:
+            for attn in self.attn_list:
+                if isinstance(attn, FullAttn):
+                    position_offset = attn.kv_cache.offset
+                    break
         Rope.build_cos_sin(torch.as_tensor(position_offset, dtype=torch.long))
         ids = torch.as_tensor(input_ids, dtype=torch.long)
         if ids.dim() == 2:
