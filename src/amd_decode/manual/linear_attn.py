@@ -13,20 +13,22 @@ class DeltaNet(object):
         self,
         prefix: str,
         wprovider: Qwen35Weights,
-        conv_state: torch.Tensor | None = None,
-        recurrent_state: torch.Tensor | None = None,
     ):
         self.prefix = prefix
         self.wmap: dict[str, torch.Tensor] = {}
         for wname in _LINEAR_ATTENTION:
             weights = wprovider.state_dict[f"{prefix}.{wname}"]
             self.wmap[wname] = weights.cuda()
-        self.conv_state = None
-        if conv_state is not None:
-            shape = list(conv_state.shape)
-            shape[-1] = 1
-            self.conv_state = torch.cat([conv_state, conv_state.new_zeros(shape)])
-        self.recurrent_state = recurrent_state
+        self.conv_state = self.recurrent_state = None
+
+    def load_prefill(
+        self, kv_dict: dict[str, torch.Tensor], max_len: int | None = None
+    ):
+        conv_state = kv_dict["conv_state"]
+        shape = list(conv_state.shape)
+        shape[-1] = 1
+        self.conv_state = torch.cat([conv_state, conv_state.new_zeros(shape)])
+        self.recurrent_state = kv_dict["recurrent_state"]
 
     def forward(self, x: torch.Tensor):
         from .function import rms_gated

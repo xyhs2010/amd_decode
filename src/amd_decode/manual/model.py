@@ -20,9 +20,7 @@ class Qwen35Xyhs(DecodeModel):
     def __init__(
         self,
         model_dir: str | Path,
-        kv_dir: str | Path,
         device: str | torch.device = "cuda",
-        max_len: int = 262144,
     ) -> None:
         self.device = torch.device(device)
         self.dtype = torch.float16
@@ -31,22 +29,22 @@ class Qwen35Xyhs(DecodeModel):
         self.ffn_list = [
             FFN(f"{LAYER_PREFIX}.{lid}", self.weights) for lid in range(NUM_LAYERS)
         ]
-        self.attn_list: list[FullAttn | DeltaNet] = []
-        kv_dir = Path(kv_dir)
-        for lid in range(NUM_LAYERS):
-            prefix = f"{LAYER_PREFIX}.{lid}"
-            kv_dict = load_file(kv_dir / f"layer_{lid:02d}.safetensors")
-            if lid % 4 == 3:
-                kv_cache = KVCache(kv_dict, max_len)
-                attn = FullAttn(prefix, self.weights, kv_cache)
-            else:
-                c_state, r_state = kv_dict["conv_state"], kv_dict["recurrent_state"]
-                attn = DeltaNet(prefix, self.weights, c_state, r_state)
-            self.attn_list.append(attn)
+        self.attn_list = [
+            (FullAttn if lid % 4 == 3 else DeltaNet)(
+                f"{LAYER_PREFIX}.{lid}", self.weights
+            )
+            for lid in range(NUM_LAYERS)
+        ]
 
         self.embed = self.weights.get(EMBED)
         self.lm_head = self.weights.get(LM_HEAD)
         self.final_norm = self.weights.get(FINAL_NORM)
+
+    def load_prefill(self, kv_dir: str = None, max_len: int | None = None) -> None:
+        kv_dir = Path(kv_dir)
+        for lid in range(NUM_LAYERS):
+            kv_dict = load_file(kv_dir / f"layer_{lid:02d}.safetensors")
+            self.attn_list[lid].load_prefill(kv_dict, max_len)
 
     def forward(
         self,

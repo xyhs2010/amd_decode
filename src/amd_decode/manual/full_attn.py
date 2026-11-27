@@ -7,6 +7,7 @@ NUM_Q_HEAD = 16
 NUM_KV_HEAD = 4
 ROPE_DIM = 64
 ROPE_THETA = 10000000
+DEFAULT_MAX_LEN = 270336
 
 
 class Rope(object):
@@ -47,7 +48,12 @@ class Rope(object):
 
 
 class KVCache(object):
-    def __init__(self, kv_dict: dict[str, torch.Tensor], max_len: int):
+    def __init__(self):
+        self._k = self._v = None
+
+    def load_prefill(
+        self, kv_dict: dict[str, torch.Tensor], max_len: int | None = None
+    ):
         k, v = kv_dict["k"], kv_dict["v"]
         shape = list(k.shape)
         self.offset = shape[2]
@@ -59,6 +65,13 @@ class KVCache(object):
         self._v[:, :, : self.offset, :].copy_(v)
 
     def append(self, k: torch.Tensor, v: torch.Tensor):
+        if self._k is None or self._v is None:
+            shape = list(k[:, :, None, :].shape)
+            shape[2] = DEFAULT_MAX_LEN
+            self._k = torch.empty(shape, dtype=k.dtype, device="cuda")
+            self._v = torch.empty_like(self.k)
+            self.offset = 0
+
         self._k[:, :, self.offset, :].copy_(k)
         self._v[:, :, self.offset, :].copy_(v)
         self.offset += 1
@@ -73,13 +86,13 @@ class KVCache(object):
 
 
 class FullAttn(object):
-    def __init__(self, prefix: str, wprovider: Qwen35Weights, kv_cache: KVCache):
+    def __init__(self, prefix: str, wprovider: Qwen35Weights):
         self.prefix = prefix
         self.wmap: dict[str, torch.Tensor] = {}
         for wname in _FULL_ATTENTION:
             weights = wprovider.state_dict[f"{prefix}.{wname}"]
             self.wmap[wname] = weights.cuda()
-        self.kv_cache = kv_cache
+        self.kv_cache = KVCache()
 
         self.qgkv_weight = torch.concat(
             [
@@ -89,6 +102,11 @@ class FullAttn(object):
             ],
             dim=0,
         )
+
+    def load_prefill(
+        self, kv_dict: dict[str, torch.Tensor], max_len: int | None = None
+    ):
+        self.kv_cache.load_prefill(kv_dict, max_len)
 
     def forward(self, x: torch.Tensor):
         import torch.nn.functional as F
