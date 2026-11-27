@@ -73,7 +73,7 @@ class DeltaNet(object):
         kv_mem = (k @ state).view(batch, NUM_LINEAR_VHEAD, LINEAR_DIM)
         delta = (v - kv_mem) * beta[..., None]
         delta = delta.view(batch, NUM_LINEAR_KHEAD, -1, 1, LINEAR_DIM)
-        state = state + k * delta
+        state = state + k[:, :, :, 0, :, None] * delta
         out = (q @ state).view(batch, NUM_LINEAR_VHEAD, LINEAR_DIM)
         self.recurrent_state = state.view(batch, -1, LINEAR_DIM, LINEAR_DIM)
         return out
